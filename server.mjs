@@ -30,6 +30,8 @@ const execAsync = promisify(exec);
 const PORT = process.env.PORT ?? "4000";
 const SERVICE_TOKEN = process.env.TRPC_SERVER_API_TOKEN ?? "";
 const PUBLISHER_HOST = process.env.PUBLISHER_HOST ?? "";
+const CF_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN ?? "";
+const CF_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID ?? "";
 // URL interne Docker pour joindre le builder sans passer par Traefik/TLS
 const BUILDER_INTERNAL_URL = process.env.BUILDER_INTERNAL_URL ?? "http://app:3000";
 const PUBLISH_DIR = "/var/publish";
@@ -189,6 +191,82 @@ const patchDataFilesForPrerender = async (dir) => {
 };
 
 /**
+ * Sanitize a domain into a valid Cloudflare Pages project name.
+ * CF Pages project names must match [a-z0-9][a-z0-9-]*[a-z0-9] and be ≤ 58 chars.
+ */
+const toCfProjectName = (domain) =>
+  domain
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 58);
+
+/**
+ * Deploy to Cloudflare Pages for the given build.
+ *
+ * Workflow:
+ *   1. webstudio sync
+ *   2. webstudio build --template cloudflare
+ *   3. npm install (first time)
+ *   4. npm run build  (remix vite:build → build/client/)
+ *   5. wrangler pages deploy ./build/client --project-name <cfProjectName>
+ */
+const publishBuildCloudflare = async ({ buildId }) => {
+  log(`Starting Cloudflare publish for build ${buildId}`);
+
+  const { projectDomain: domain } = await getProjectBuildInfo(buildId);
+  log(`Project domain: ${domain}`);
+
+  const workDir = join(WORK_DIR, domain);
+  await mkdir(workDir, { recursive: true });
+
+  const run = async (cmd, extraEnv = {}) => {
+    log(`  $ ${cmd}`);
+    const { stdout, stderr } = await execAsync(cmd, {
+      cwd: workDir,
+      maxBuffer: 10 * 1024 * 1024,
+      env: { ...process.env, ...extraEnv },
+    });
+    if (stdout) log(`  stdout: ${stdout.trim()}`);
+    if (stderr) log(`  stderr: ${stderr.trim()}`);
+  };
+
+  // 1. Sync build data
+  log(`Syncing build data for ${domain}...`);
+  await run(
+    `webstudio sync --buildId=${buildId} --origin=${BUILDER_INTERNAL_URL} --authToken=${SERVICE_TOKEN}`
+  );
+
+  // 2. Generate Cloudflare project code
+  log(`Generating Cloudflare code for ${domain}...`);
+  await run(`webstudio build --template cloudflare`);
+
+  // 3. Install npm dependencies (first publish only)
+  const nodeModulesPath = join(workDir, "node_modules");
+  if (!(await pathExists(nodeModulesPath))) {
+    log(`Installing dependencies for ${domain}...`);
+    await run(`npm install`);
+  }
+
+  // 4. Build with Remix/Vite
+  log(`Building Cloudflare bundle for ${domain}...`);
+  await run(`npm run build`);
+
+  // 5. Deploy to Cloudflare Pages
+  const cfProjectName = toCfProjectName(domain);
+  log(`Deploying ${domain} to Cloudflare Pages project "${cfProjectName}"...`);
+  await run(
+    `wrangler pages deploy ./build/client --project-name ${cfProjectName}`,
+    {
+      CLOUDFLARE_API_TOKEN: CF_API_TOKEN,
+      CLOUDFLARE_ACCOUNT_ID: CF_ACCOUNT_ID,
+    }
+  );
+
+  log(`Successfully deployed ${domain} to Cloudflare Pages`);
+};
+
+/**
  * Generate static files for the given build and write to /var/publish/<domain>/
  */
 const publishBuild = async ({ buildId, builderOrigin }) => {
@@ -325,10 +403,22 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      const { buildId, builderOrigin } = input;
+      const { buildId, builderOrigin, buildMode = "ssg" } = input;
       if (!buildId || !builderOrigin) {
         res.writeHead(400);
         res.end("Missing buildId or builderOrigin");
+        return;
+      }
+
+      if (buildMode !== "ssg" && buildMode !== "cloudflare") {
+        res.writeHead(400);
+        res.end(`Unknown buildMode: ${buildMode}`);
+        return;
+      }
+
+      if (buildMode === "cloudflare" && (!CF_API_TOKEN || !CF_ACCOUNT_ID)) {
+        res.writeHead(400);
+        res.end("CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID must be set for cloudflare builds");
         return;
       }
 
@@ -337,8 +427,13 @@ const server = createServer(async (req, res) => {
 
       const tempDomainKey = `${builderOrigin}:${buildId}`;
       const q = getProjectQueue(tempDomainKey);
+      const job =
+        buildMode === "cloudflare"
+          ? () => publishBuildCloudflare({ buildId })
+          : () => publishBuild({ buildId, builderOrigin });
+
       q.current = q.current
-        .then(() => publishBuild({ buildId, builderOrigin }))
+        .then(job)
         .then(() => notifyBuildStatus(buildId, "PUBLISHED"))
         .catch((err) => {
           logErr(`Publish failed for build ${buildId}: ${err.message}`);
