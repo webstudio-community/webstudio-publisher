@@ -854,6 +854,12 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === "GET" && req.url === "/capabilities") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ cloudflare: !!(CF_API_TOKEN && CF_ACCOUNT_ID) }));
+    return;
+  }
+
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200);
     res.end("ok");
