@@ -397,8 +397,22 @@ const toCfProjectName = (domain) =>
  *   4. npm run build  (remix vite:build → build/client/)
  *   5. wrangler pages deploy ./build/client --project-name <cfProjectName>
  */
+let wranglerInstalled = false;
+const ensureWrangler = async () => {
+  if (wranglerInstalled) return;
+  try {
+    await execAsync("wrangler --version");
+    wranglerInstalled = true;
+  } catch {
+    log("Installing wrangler (first Cloudflare publish)...");
+    await execAsync("npm install -g wrangler");
+    wranglerInstalled = true;
+  }
+};
+
 const publishBuildCloudflare = async ({ buildId }) => {
   log(`Starting Cloudflare publish for build ${buildId}`);
+  await ensureWrangler();
 
   const { projectDomain: domain } = await getProjectBuildInfo(buildId);
   log(`Project domain: ${domain}`);
