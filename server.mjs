@@ -43,6 +43,9 @@ const CF_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID ?? "";
 const BUILDER_INTERNAL_URL = process.env.BUILDER_INTERNAL_URL ?? "http://app:3000";
 const PUBLISH_DIR = "/var/publish";
 const WORK_DIR = "/var/work";
+// Shared node_modules seed — all SSR domains use the same template = same deps.
+// First domain installs via npm; subsequent domains clone via hardlinks (~instant).
+const SSR_SEED_DIR = join(WORK_DIR, ".ssr-seed");
 // When set, the publisher writes a per-domain Traefik dynamic config file so
 // Traefik can request a Let's Encrypt certificate for each custom domain.
 // Mount /data/coolify/proxy/dynamic into the container and set this to that path.
@@ -595,6 +598,52 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
  *   4. npm run build  (react-router build → build/server/index.js)
  *   5. start/restart react-router-serve on allocated port
  */
+/**
+ * Install SSR dependencies for a domain workDir.
+ *
+ * All SSR domains are scaffolded from the same react-router-docker template and
+ * end up with an identical package.json. To avoid a full npm install for every
+ * new domain we keep a seed at SSR_SEED_DIR:
+ *   - First call: runs npm install, then hard-links node_modules into the seed.
+ *   - Subsequent calls: clones the seed via cp -al (hardlinks — near-instant,
+ *     no extra disk space, same /var/work volume so same filesystem).
+ * The seed is invalidated when package.json changes (e.g. webstudio CLI update).
+ */
+const installSsrDeps = async (workDir, run) => {
+  const nodeModulesPath = join(workDir, "node_modules");
+  const seedNodeModules = join(SSR_SEED_DIR, "node_modules");
+  const seedPkg = join(SSR_SEED_DIR, "package.json");
+  const currentPkg = join(workDir, "package.json");
+
+  let seedValid = false;
+  if (await pathExists(seedNodeModules) && await pathExists(seedPkg)) {
+    try {
+      const [a, b] = await Promise.all([
+        readFile(seedPkg, "utf8"),
+        readFile(currentPkg, "utf8"),
+      ]);
+      seedValid = a === b;
+    } catch { /* seed check failed — fall through to full install */ }
+  }
+
+  if (seedValid) {
+    log(`Cloning deps from seed via hardlinks...`);
+    await execAsync(`cp -al "${seedNodeModules}" "${nodeModulesPath}"`);
+    return;
+  }
+
+  await run(`npm install`);
+
+  // Save or refresh the seed
+  log(`Saving deps seed for future installs...`);
+  await mkdir(SSR_SEED_DIR, { recursive: true });
+  if (await pathExists(seedNodeModules)) {
+    await rm(seedNodeModules, { recursive: true, force: true });
+  }
+  await execAsync(`cp -al "${nodeModulesPath}" "${seedNodeModules}"`);
+  await cp(currentPkg, seedPkg);
+};
+
 const publishBuildSsr = async ({ buildId }) => {
   log(`Starting SSR publish for build ${buildId}`);
 
@@ -650,7 +699,7 @@ const publishBuildSsr = async ({ buildId }) => {
 
   if (!(await pathExists(nodeModulesPath))) {
     log(`Installing dependencies for ${domain}...`);
-    await run(`npm install`);
+    await installSsrDeps(workDir, run);
   }
 
   // 4. Build
