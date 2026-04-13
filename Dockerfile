@@ -12,6 +12,8 @@ COPY server.mjs /app/server.mjs
 RUN mkdir -p /var/publish /var/work
 
 ENV PORT=4000
+ENV PROXY_PORT=4001
 EXPOSE 4000
+EXPOSE 4001
 
 CMD ["node", "/app/server.mjs"]
