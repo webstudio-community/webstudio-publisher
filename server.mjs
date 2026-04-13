@@ -2,32 +2,39 @@
  * Self-hosted Webstudio publisher service.
  *
  * Receives publish requests from the builder app and generates static HTML files
- * using the Webstudio CLI (webstudio sync + build + vite build).
- * The output is written to /var/publish/<domain>/ which Nginx serves.
+ * (SSG) or runs a Node SSR server (SSR) depending on buildMode.
  *
- * Workflow per project (keyed by domain):
- *   1. First publish: `webstudio sync` + `webstudio build --template ssg` +
- *      `npm install` (once) + `vite build` → copy dist/ to /var/publish/<domain>/
- *   2. Subsequent publishes: repeat from step 1, npm install is skipped if
- *      node_modules already exists.
+ * Build modes (POST /publish { buildId, builderOrigin, buildMode }):
+ *   ssg        — Vite prerender → static files in /var/publish/<domain>/
+ *   cloudflare — React Router build + wrangler pages deploy
+ *   ssr        — React Router build → react-router-serve subprocess + proxy on PROXY_PORT
+ *
+ * SSR proxy (port PROXY_PORT, default 4001):
+ *   Serves all published sites — SSR domains are proxied to their subprocess,
+ *   SSG domains are served directly from /var/publish/<domain>/.
+ *   The self-host stack should route *.PUBLISHER_HOST traffic to this port.
  *
  * Environment variables:
  *   TRPC_SERVER_API_TOKEN  — service token to authenticate with the builder app
  *   BUILDER_INTERNAL_URL   — internal Docker URL for the builder (default: http://app:3000)
- *                            Used for REST API calls and webstudio sync --origin.
- *                            Avoids going through Traefik/TLS from within the container.
- *   PORT                   — HTTP port (default: 4000)
+ *   PORT                   — build API HTTP port (default: 4000)
+ *   PROXY_PORT             — site proxy HTTP port (default: 4001)
+ *   SSR_PORT_BASE          — base port for react-router-serve subprocesses (default: 5000)
+ *                            ports 5001, 5002… are assigned per domain
  */
 
-import { createServer } from "node:http";
-import { exec } from "node:child_process";
-import { mkdir, cp, rm, access, readdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { createServer, request as httpRequest } from "node:http";
+import { exec, spawn } from "node:child_process";
+import { createReadStream } from "node:fs";
+import { mkdir, cp, rm, access, readdir, readFile, writeFile, stat } from "node:fs/promises";
+import { join, extname } from "node:path";
 import { promisify } from "node:util";
 
 const execAsync = promisify(exec);
 
 const PORT = process.env.PORT ?? "4000";
+const PROXY_PORT = process.env.PROXY_PORT ?? "4001";
+const SSR_PORT_BASE = parseInt(process.env.SSR_PORT_BASE ?? "5000");
 const SERVICE_TOKEN = process.env.TRPC_SERVER_API_TOKEN ?? "";
 const PUBLISHER_HOST = process.env.PUBLISHER_HOST ?? "";
 const CF_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN ?? "";
@@ -36,6 +43,9 @@ const CF_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID ?? "";
 const BUILDER_INTERNAL_URL = process.env.BUILDER_INTERNAL_URL ?? "http://app:3000";
 const PUBLISH_DIR = "/var/publish";
 const WORK_DIR = "/var/work";
+// Shared node_modules seed — all SSR domains use the same template = same deps.
+// First domain installs via npm; subsequent domains clone via hardlinks (~instant).
+const SSR_SEED_DIR = join(WORK_DIR, ".ssr-seed");
 // When set, the publisher writes a per-domain Traefik dynamic config file so
 // Traefik can request a Let's Encrypt certificate for each custom domain.
 // Mount /data/coolify/proxy/dynamic into the container and set this to that path.
@@ -44,14 +54,188 @@ const TRAEFIK_DYNAMIC_DIR = process.env.TRAEFIK_DYNAMIC_DIR ?? "";
 const log = (msg) => console.info(`[publisher] ${msg}`);
 const logErr = (msg) => console.error(`[publisher] ${msg}`);
 
-/** Serialize publish jobs per domain to avoid concurrent vite builds. */
+// ─── SSR process management ──────────────────────────────────────────────────
+
+// domain (project slug) → port number (persisted across restarts via state.json)
+const ssrDomainPort = new Map();
+// hostname (publishDomain or customDomain) → port number (for proxy routing)
+const ssrHostPort = new Map();
+// domain (project slug) → ChildProcess
+const ssrProcesses = new Map();
+// Next available port for a new SSR domain
+let nextSsrPort = SSR_PORT_BASE + 1;
+
+/**
+ * Return the persistent port for an SSR domain, allocating a new one if needed.
+ */
+const allocateSsrPort = (domain) => {
+  if (ssrDomainPort.has(domain)) return ssrDomainPort.get(domain);
+  const port = nextSsrPort++;
+  ssrDomainPort.set(domain, port);
+  return port;
+};
+
+/**
+ * Start (or restart on republish) the react-router-serve process for an SSR site.
+ * If a process is already running for this domain, it is killed first — the old
+ * process keeps serving during the rebuild so there is no downtime.
+ */
+const startSsrProcess = (domain, workDir, port) => {
+  const existing = ssrProcesses.get(domain);
+  if (existing) {
+    log(`Stopping previous SSR process for ${domain}`);
+    try { existing.kill("SIGTERM"); } catch {}
+    ssrProcesses.delete(domain);
+  }
+
+  const child = spawn(
+    "node",
+    ["node_modules/.bin/react-router-serve", "build/server/index.js"],
+    {
+      cwd: workDir,
+      env: { ...process.env, PORT: String(port) },
+      stdio: "pipe",
+    }
+  );
+
+  child.stdout.on("data", (d) => log(`[ssr:${domain}] ${d.toString().trim()}`));
+  child.stderr.on("data", (d) => logErr(`[ssr:${domain}] ${d.toString().trim()}`));
+  child.on("exit", (code, signal) => {
+    log(`[ssr:${domain}] process exited (code=${code}, signal=${signal})`);
+    ssrProcesses.delete(domain);
+  });
+
+  ssrProcesses.set(domain, child);
+  return child;
+};
+
+/**
+ * Stop a running SSR process and remove its proxy routing entries.
+ * Called when a domain is republished in SSG mode (mode switch).
+ */
+const stopSsrForDomain = (domain, publishDomain, customDomains) => {
+  const proc = ssrProcesses.get(domain);
+  if (proc) {
+    log(`Stopping SSR process for ${domain} (switching to SSG)`);
+    try { proc.kill("SIGTERM"); } catch {}
+    ssrProcesses.delete(domain);
+  }
+  ssrHostPort.delete(publishDomain);
+  for (const cd of customDomains) ssrHostPort.delete(cd);
+  ssrDomainPort.delete(domain);
+};
+
+/**
+ * On publisher startup, read state.json files and restart any SSR processes.
+ */
+const restoreSsrProcesses = async () => {
+  let entries;
+  try {
+    entries = await readdir(WORK_DIR, { withFileTypes: true });
+  } catch {
+    return; // WORK_DIR empty or not yet created
+  }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const domain = entry.name;
+    const stateFile = join(WORK_DIR, domain, "state.json");
+    try {
+      const state = JSON.parse(await readFile(stateFile, "utf8"));
+      if (state.mode !== "ssr") continue;
+
+      const { port, publishDomain, customDomains = [] } = state;
+      const workDir = join(WORK_DIR, domain);
+      const serverEntry = join(workDir, "build", "server", "index.js");
+
+      if (!(await pathExists(serverEntry))) {
+        log(`Skipping SSR restore for ${domain}: build/server/index.js not found`);
+        continue;
+      }
+
+      // Reconstruct port mappings
+      ssrDomainPort.set(domain, port);
+      if (port >= nextSsrPort) nextSsrPort = port + 1;
+      ssrHostPort.set(publishDomain, port);
+      for (const cd of customDomains) ssrHostPort.set(cd, port);
+
+      startSsrProcess(domain, workDir, port);
+      log(`Restored SSR process for ${domain} (port ${port})`);
+    } catch {
+      // No state.json or invalid JSON — skip
+    }
+  }
+};
+
+// ─── SSG proxy: static file serving ─────────────────────────────────────────
+
+const MIME_TYPES = {
+  ".html": "text/html; charset=utf-8",
+  ".css": "text/css",
+  ".js": "application/javascript",
+  ".mjs": "application/javascript",
+  ".json": "application/json",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".svg": "image/svg+xml",
+  ".ico": "image/x-icon",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".ttf": "font/ttf",
+  ".eot": "application/vnd.ms-fontobject",
+  ".txt": "text/plain",
+  ".xml": "application/xml",
+  ".webp": "image/webp",
+  ".avif": "image/avif",
+};
+
+const getMimeType = (filePath) =>
+  MIME_TYPES[extname(filePath).toLowerCase()] ?? "application/octet-stream";
+
+/**
+ * Try to serve a static file from /var/publish/<host>/<urlPath>.
+ * Falls back to <urlPath>.html then <urlPath>/index.html.
+ * Returns true if a file was served, false if nothing matched (caller sends 404).
+ */
+const tryServeStaticFile = async (req, res, host) => {
+  const urlPath = req.url.split("?")[0];
+  const baseDir = join(PUBLISH_DIR, host);
+  const candidates = [
+    join(baseDir, urlPath),
+    join(baseDir, urlPath + ".html"),
+    join(baseDir, urlPath, "index.html"),
+  ];
+
+  for (const filePath of candidates) {
+    try {
+      const s = await stat(filePath);
+      if (!s.isFile()) continue;
+      const mime = getMimeType(filePath);
+      const isImmutable = urlPath.includes("/_assets/") || urlPath.includes("/assets/");
+      res.writeHead(200, {
+        "Content-Type": mime,
+        "Content-Length": s.size,
+        "Cache-Control": isImmutable ? "public, max-age=31536000, immutable" : "no-cache",
+      });
+      createReadStream(filePath).pipe(res);
+      return true;
+    } catch {
+      // file not found — try next candidate
+    }
+  }
+  return false;
+};
+
+// ─── Build pipeline helpers ───────────────────────────────────────────────────
+
+/** Serialize publish jobs per domain to avoid concurrent builds. */
 const projectQueues = new Map();
 
 const getProjectQueue = (domain) => {
   const existing = projectQueues.get(domain);
-  if (existing) {
-    return existing;
-  }
+  if (existing) return existing;
   const q = { current: Promise.resolve() };
   projectQueues.set(domain, q);
   return q;
@@ -81,7 +265,7 @@ const getProjectBuildInfo = async (buildId) => {
 
 /**
  * Notify the builder app of the final publish status for a build.
- * Called after the vite build completes (PUBLISHED) or fails (FAILED).
+ * Called after the build completes (PUBLISHED) or fails (FAILED).
  */
 const notifyBuildStatus = async (buildId, publishStatus) => {
   const url = new URL(`/rest/build/${buildId}/status`, BUILDER_INTERNAL_URL);
@@ -201,6 +385,8 @@ const toCfProjectName = (domain) =>
     .replace(/^-+|-+$/g, "")
     .slice(0, 58);
 
+// ─── Build pipelines ──────────────────────────────────────────────────────────
+
 /**
  * Deploy to Cloudflare Pages for the given build.
  *
@@ -211,8 +397,22 @@ const toCfProjectName = (domain) =>
  *   4. npm run build  (remix vite:build → build/client/)
  *   5. wrangler pages deploy ./build/client --project-name <cfProjectName>
  */
+let wranglerInstalled = false;
+const ensureWrangler = async () => {
+  if (wranglerInstalled) return;
+  try {
+    await execAsync("wrangler --version");
+    wranglerInstalled = true;
+  } catch {
+    log("Installing wrangler (first Cloudflare publish)...");
+    await execAsync("npm install -g wrangler");
+    wranglerInstalled = true;
+  }
+};
+
 const publishBuildCloudflare = async ({ buildId }) => {
   log(`Starting Cloudflare publish for build ${buildId}`);
+  await ensureWrangler();
 
   const { projectDomain: domain } = await getProjectBuildInfo(buildId);
   log(`Project domain: ${domain}`);
@@ -267,10 +467,11 @@ const publishBuildCloudflare = async ({ buildId }) => {
 };
 
 /**
- * Generate static files for the given build and write to /var/publish/<domain>/
+ * Generate static files for the given build and write to /var/publish/<domain>/.
+ * If the domain previously had an SSR process running, it is stopped first.
  */
 const publishBuild = async ({ buildId, builderOrigin }) => {
-  log(`Starting publish for build ${buildId}`);
+  log(`Starting SSG publish for build ${buildId}`);
 
   const { projectDomain: domain, customDomains } = await getProjectBuildInfo(buildId);
   log(`Project domain: ${domain}`);
@@ -278,8 +479,8 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
     log(`Custom domains: ${customDomains.join(", ")}`);
   }
 
-  // Nginx serves from /var/publish/$host — for wstd slugs (no dot), append PUBLISHER_HOST
-  // to match the full hostname. Custom domains (contain a dot) are used as-is.
+  // Nginx / proxy serves from /var/publish/$host — for wstd slugs (no dot), append
+  // PUBLISHER_HOST to match the full hostname. Custom domains are used as-is.
   const publishDomain =
     !domain.includes(".") && PUBLISHER_HOST
       ? `${domain}.${PUBLISHER_HOST}`
@@ -287,6 +488,18 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
 
   const workDir = join(WORK_DIR, domain);
   await mkdir(workDir, { recursive: true });
+
+  // Stop any running SSR process for this domain (mode switch SSR→SSG)
+  const stateFile = join(workDir, "state.json");
+  try {
+    const prevState = JSON.parse(await readFile(stateFile, "utf8"));
+    if (prevState.mode === "ssr") {
+      stopSsrForDomain(domain, prevState.publishDomain, prevState.customDomains ?? []);
+      await rm(stateFile, { force: true });
+    }
+  } catch {
+    // No state.json or not SSR — nothing to stop
+  }
 
   const run = async (cmd) => {
     log(`  $ ${cmd}`);
@@ -359,7 +572,7 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
     try {
       for (const e of await readdir(dir, { withFileTypes: true })) {
         const p = join(dir, e.name);
-        if (e.isDirectory()) found.push(...await findHtmlFiles(p));
+        if (e.isDirectory()) found.push(...(await findHtmlFiles(p)));
         else if (e.name.endsWith(".html")) found.push(p);
       }
     } catch { /* dir may not exist */ }
@@ -370,14 +583,13 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
     throw new Error(`Prerender produced no HTML files. Check vite build output for errors.`);
   }
 
-  // 5. Copy built files to the Nginx serve directory
+  // 5. Copy built files to the serve directory
   const destDir = join(PUBLISH_DIR, publishDomain);
   log(`Publishing ${domain} to ${destDir}...`);
   await rm(destDir, { recursive: true, force: true });
   await cp(distDir, destDir, { recursive: true });
 
   // 5b. Also copy to each verified custom domain directory.
-  // Nginx serves from /var/publish/$host — custom domains need their own directory.
   for (const customDomain of customDomains) {
     const customDestDir = join(PUBLISH_DIR, customDomain);
     log(`Publishing custom domain ${customDomain} to ${customDestDir}...`);
@@ -388,6 +600,201 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
 
   log(`Successfully published ${domain}`);
 };
+
+/**
+ * Build an SSR site using the react-router-docker template and start a
+ * react-router-serve subprocess. The site is served via the proxy on PROXY_PORT.
+ *
+ * Workflow:
+ *   1. webstudio sync
+ *   2. webstudio build --template docker
+ *   3. npm install (first time, or if switching from SSG)
+ *   4. npm run build  (react-router build → build/server/index.js)
+ *   5. start/restart react-router-serve on allocated port
+ */
+/**
+ * Install SSR dependencies for a domain workDir.
+ *
+ * All SSR domains are scaffolded from the same react-router-docker template and
+ * end up with an identical package.json. To avoid a full npm install for every
+ * new domain we keep a seed at SSR_SEED_DIR:
+ *   - First call: runs npm install, then hard-links node_modules into the seed.
+ *   - Subsequent calls: clones the seed via cp -al (hardlinks — near-instant,
+ *     no extra disk space, same /var/work volume so same filesystem).
+ * The seed is invalidated when package.json changes (e.g. webstudio CLI update).
+ */
+const installSsrDeps = async (workDir, run) => {
+  const nodeModulesPath = join(workDir, "node_modules");
+  const seedNodeModules = join(SSR_SEED_DIR, "node_modules");
+  const seedPkg = join(SSR_SEED_DIR, "package.json");
+  const currentPkg = join(workDir, "package.json");
+
+  let seedValid = false;
+  if (await pathExists(seedNodeModules) && await pathExists(seedPkg)) {
+    try {
+      const [a, b] = await Promise.all([
+        readFile(seedPkg, "utf8"),
+        readFile(currentPkg, "utf8"),
+      ]);
+      seedValid = a === b;
+    } catch { /* seed check failed — fall through to full install */ }
+  }
+
+  if (seedValid) {
+    log(`Cloning deps from seed via hardlinks...`);
+    await execAsync(`cp -al "${seedNodeModules}" "${nodeModulesPath}"`);
+    return;
+  }
+
+  await run(`npm install`);
+
+  // Save or refresh the seed
+  log(`Saving deps seed for future installs...`);
+  await mkdir(SSR_SEED_DIR, { recursive: true });
+  if (await pathExists(seedNodeModules)) {
+    await rm(seedNodeModules, { recursive: true, force: true });
+  }
+  await execAsync(`cp -al "${nodeModulesPath}" "${seedNodeModules}"`);
+  await cp(currentPkg, seedPkg);
+};
+
+const publishBuildSsr = async ({ buildId }) => {
+  log(`Starting SSR publish for build ${buildId}`);
+
+  const { projectDomain: domain, customDomains } = await getProjectBuildInfo(buildId);
+  log(`Project domain: ${domain}`);
+  if (customDomains.length > 0) {
+    log(`Custom domains: ${customDomains.join(", ")}`);
+  }
+
+  const publishDomain =
+    !domain.includes(".") && PUBLISHER_HOST
+      ? `${domain}.${PUBLISHER_HOST}`
+      : domain;
+
+  const workDir = join(WORK_DIR, domain);
+  await mkdir(workDir, { recursive: true });
+
+  const run = async (cmd) => {
+    log(`  $ ${cmd}`);
+    const { stdout, stderr } = await execAsync(cmd, {
+      cwd: workDir,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+    if (stdout) log(`  stdout: ${stdout.trim()}`);
+    if (stderr) log(`  stderr: ${stderr.trim()}`);
+  };
+
+  // 1. Sync build data
+  log(`Syncing build data for ${domain}...`);
+  await run(
+    `webstudio sync --buildId=${buildId} --origin=${BUILDER_INTERNAL_URL} --authToken=${SERVICE_TOKEN}`
+  );
+
+  // 2. Generate SSR code with Docker template (react-router-docker)
+  log(`Generating SSR code for ${domain}...`);
+  await run(`webstudio build --template docker`);
+
+  // 3. Install dependencies.
+  // Force a clean install when switching from SSG: vike/SSG deps are incompatible
+  // with the react-router template, and the old dist/client dir signals a prior SSG build.
+  const nodeModulesPath = join(workDir, "node_modules");
+  const wasSsg = await pathExists(join(workDir, "dist", "client"));
+  if (wasSsg) {
+    log(`Detected previous SSG build — clearing node_modules for clean SSR install`);
+    await rm(nodeModulesPath, { recursive: true, force: true });
+    // Remove stale SSG static output so the proxy stops serving it
+    const publishDestDir = join(PUBLISH_DIR, publishDomain);
+    if (await pathExists(publishDestDir)) {
+      await rm(publishDestDir, { recursive: true, force: true });
+      log(`Removed stale SSG output at ${publishDestDir}`);
+    }
+  }
+
+  if (!(await pathExists(nodeModulesPath))) {
+    log(`Installing dependencies for ${domain}...`);
+    await installSsrDeps(workDir, run);
+  }
+
+  // 4. Build
+  log(`Building SSR bundle for ${domain}...`);
+  await run(`npm run build`);
+
+  const serverEntry = join(workDir, "build", "server", "index.js");
+  if (!(await pathExists(serverEntry))) {
+    throw new Error(`SSR build produced no server entry. Expected: ${serverEntry}`);
+  }
+
+  // 5. Allocate port + persist state so the process is restored on container restart
+  const port = allocateSsrPort(domain);
+  await writeFile(
+    join(workDir, "state.json"),
+    JSON.stringify({ mode: "ssr", port, publishDomain, customDomains }, null, 2) + "\n",
+    "utf8"
+  );
+
+  // 6. Register host → port mappings for the proxy
+  ssrHostPort.set(publishDomain, port);
+  for (const cd of customDomains) {
+    ssrHostPort.set(cd, port);
+    await writeTraefikRouteForDomain(cd);
+  }
+
+  // 7. Start (or hot-swap) the SSR subprocess — old process keeps serving during build
+  log(`Starting SSR process for ${domain} on port ${port}...`);
+  startSsrProcess(domain, workDir, port);
+
+  log(`Successfully published SSR site ${domain} (subprocess port ${port})`);
+};
+
+// ─── Site proxy (SSR + SSG) ───────────────────────────────────────────────────
+
+/**
+ * Unified HTTP proxy that serves all published Webstudio sites:
+ *   - SSR domains  → reverse-proxied to their react-router-serve subprocess
+ *   - SSG domains  → served directly from /var/publish/<host>/
+ *
+ * The self-host stack should route *.PUBLISHER_HOST traffic here (PROXY_PORT).
+ */
+const proxyServer = createServer(async (req, res) => {
+  const host = (req.headers["x-forwarded-host"] ?? req.headers.host ?? "").split(":")[0];
+
+  // SSR: proxy to the react-router-serve subprocess
+  const ssrPort = ssrHostPort.get(host);
+  if (ssrPort !== undefined) {
+    const proxyReq = httpRequest(
+      {
+        hostname: "127.0.0.1",
+        port: ssrPort,
+        path: req.url,
+        method: req.method,
+        headers: { ...req.headers, host },
+      },
+      (proxyRes) => {
+        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+        proxyRes.pipe(res, { end: true });
+      }
+    );
+    proxyReq.on("error", (err) => {
+      logErr(`SSR proxy error for ${host}: ${err.message}`);
+      if (!res.headersSent) {
+        res.writeHead(502);
+        res.end("SSR proxy error");
+      }
+    });
+    req.pipe(proxyReq, { end: true });
+    return;
+  }
+
+  // SSG: serve static files from /var/publish/<host>/
+  const served = await tryServeStaticFile(req, res, host);
+  if (!served) {
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("Not found");
+  }
+});
+
+// ─── Build API server ─────────────────────────────────────────────────────────
 
 const server = createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/publish") {
@@ -410,7 +817,7 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      if (buildMode !== "ssg" && buildMode !== "cloudflare") {
+      if (buildMode !== "ssg" && buildMode !== "cloudflare" && buildMode !== "ssr") {
         res.writeHead(400);
         res.end(`Unknown buildMode: ${buildMode}`);
         return;
@@ -430,7 +837,9 @@ const server = createServer(async (req, res) => {
       const job =
         buildMode === "cloudflare"
           ? () => publishBuildCloudflare({ buildId })
-          : () => publishBuild({ buildId, builderOrigin });
+          : buildMode === "ssr"
+            ? () => publishBuildSsr({ buildId })
+            : () => publishBuild({ buildId, builderOrigin });
 
       q.current = q.current
         .then(job)
@@ -445,6 +854,12 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === "GET" && req.url === "/capabilities") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ cloudflare: !!(CF_API_TOKEN && CF_ACCOUNT_ID) }));
+    return;
+  }
+
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200);
     res.end("ok");
@@ -453,6 +868,14 @@ const server = createServer(async (req, res) => {
 
   res.writeHead(404);
   res.end("Not found");
+});
+
+// ─── Startup ──────────────────────────────────────────────────────────────────
+
+await restoreSsrProcesses();
+
+proxyServer.listen(PROXY_PORT, () => {
+  log(`Site proxy listening on port ${PROXY_PORT} (SSR + SSG)`);
 });
 
 server.listen(PORT, () => {
