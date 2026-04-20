@@ -561,9 +561,9 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
     await run(`npm install`);
   }
 
-  // 4. Build static HTML with Vite
+  // 4. Build static HTML with Vite + vike prerender
   log(`Building static site for ${domain}...`);
-  await run(`WEBSTUDIO_PRERENDER_ORIGIN=${BUILDER_INTERNAL_URL} npx vite build`);
+  await run(`WEBSTUDIO_PRERENDER_ORIGIN=${BUILDER_INTERNAL_URL} npm run build`);
 
   // Check output
   const distDir = join(workDir, "dist", "client");
