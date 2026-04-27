@@ -143,7 +143,8 @@ const stopDockerForDomain = async (domain, containerName, publishDomain, customD
 };
 
 /**
- * On publisher startup, read state.json files and restart any SSR processes.
+ * On publisher startup, read state.json files and restore SSR processes and
+ * Docker containers. Reconstructs ssrHostPort so the proxy routes correctly.
  */
 const restoreSsrProcesses = async () => {
   let entries;
@@ -159,25 +160,54 @@ const restoreSsrProcesses = async () => {
     const stateFile = join(WORK_DIR, domain, "state.json");
     try {
       const state = JSON.parse(await readFile(stateFile, "utf8"));
-      if (state.mode !== "ssr") continue;
 
-      const { port, publishDomain, customDomains = [] } = state;
-      const workDir = join(WORK_DIR, domain);
-      const serverEntry = join(workDir, "build", "server", "index.js");
+      if (state.mode === "ssr") {
+        const { port, publishDomain, customDomains = [] } = state;
+        const workDir = join(WORK_DIR, domain);
+        const serverEntry = join(workDir, "build", "server", "index.js");
 
-      if (!(await pathExists(serverEntry))) {
-        log(`Skipping SSR restore for ${domain}: build/server/index.js not found`);
-        continue;
+        if (!(await pathExists(serverEntry))) {
+          log(`Skipping SSR restore for ${domain}: build/server/index.js not found`);
+          continue;
+        }
+
+        ssrDomainPort.set(domain, port);
+        if (port >= nextSsrPort) nextSsrPort = port + 1;
+        ssrHostPort.set(publishDomain, port);
+        for (const cd of customDomains) ssrHostPort.set(cd, port);
+
+        startSsrProcess(domain, workDir, port);
+        log(`Restored SSR process for ${domain} (port ${port})`);
+
+      } else if (state.mode === "docker") {
+        const { port, containerName, publishDomain, customDomains = [] } = state;
+
+        // Ensure the container is running — restart it if stopped
+        let isRunning = false;
+        try {
+          const { stdout } = await execAsync(
+            `docker inspect --format='{{.State.Running}}' ${containerName}`
+          );
+          isRunning = stdout.trim() === "'true'" || stdout.trim() === "true";
+        } catch { /* container doesn't exist */ }
+
+        if (!isRunning) {
+          try {
+            await execAsync(`docker start ${containerName}`);
+            log(`Restarted Docker container ${containerName} for ${domain}`);
+          } catch (err) {
+            logErr(`Failed to restart Docker container ${containerName} for ${domain}: ${err.message}`);
+            continue;
+          }
+        }
+
+        dockerDomainPort.set(domain, port);
+        if (port >= nextDockerPort) nextDockerPort = port + 1;
+        ssrHostPort.set(publishDomain, port);
+        for (const cd of customDomains) ssrHostPort.set(cd, port);
+
+        log(`Restored Docker container ${containerName} for ${domain} (port ${port})`);
       }
-
-      // Reconstruct port mappings
-      ssrDomainPort.set(domain, port);
-      if (port >= nextSsrPort) nextSsrPort = port + 1;
-      ssrHostPort.set(publishDomain, port);
-      for (const cd of customDomains) ssrHostPort.set(cd, port);
-
-      startSsrProcess(domain, workDir, port);
-      log(`Restored SSR process for ${domain} (port ${port})`);
     } catch {
       // No state.json or invalid JSON — skip
     }
