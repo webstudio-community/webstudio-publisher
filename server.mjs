@@ -823,6 +823,111 @@ const publishBuildSsr = async ({ buildId }) => {
   log(`Successfully published SSR site ${domain} (subprocess port ${port})`);
 };
 
+// ─── Docker mode: build pipeline ─────────────────────────────────────────────
+
+/**
+ * Sanitize a domain slug into a valid Docker image/container name.
+ * Docker names must match [a-z0-9][a-z0-9_.-]* — we use a ws- prefix so
+ * short slugs like "my-site" become "ws-my-site" and can't shadow system images.
+ */
+const toDockerName = (domain) =>
+  "ws-" +
+  domain
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+/**
+ * Build an SSR site as a Docker container per domain.
+ *
+ * Workflow:
+ *   1. webstudio sync
+ *   2. webstudio build --template docker
+ *   3. Write DOCKER_SITE_DOCKERFILE into workDir
+ *   4. docker build -t <image> .   ← built ONCE, reused for all hostnames
+ *   5. For each hostname: docker stop/rm (ignore errors) + docker run -p PORT:3000
+ *   6. docker image prune -f
+ *   7. Persist state.json + register all hostnames in ssrHostPort (proxy reuse)
+ */
+const publishBuildDocker = async ({ buildId }) => {
+  log(`Starting Docker publish for build ${buildId}`);
+
+  const { projectDomain: domain, customDomains } = await getProjectBuildInfo(buildId);
+  log(`Project domain: ${domain}`);
+  if (customDomains.length > 0) {
+    log(`Custom domains: ${customDomains.join(", ")}`);
+  }
+
+  const publishDomain =
+    !domain.includes(".") && PUBLISHER_HOST
+      ? `${domain}.${PUBLISHER_HOST}`
+      : domain;
+
+  const workDir = join(WORK_DIR, domain);
+  await mkdir(workDir, { recursive: true });
+
+  const run = async (cmd, extraEnv = {}) => {
+    log(`  $ ${cmd}`);
+    const { stdout, stderr } = await execAsync(cmd, {
+      cwd: workDir,
+      maxBuffer: 10 * 1024 * 1024,
+      env: { ...process.env, ...extraEnv },
+    });
+    if (stdout) log(`  stdout: ${stdout.trim()}`);
+    if (stderr) log(`  stderr: ${stderr.trim()}`);
+  };
+
+  // 1. Sync build data
+  log(`Syncing build data for ${domain}...`);
+  await run(
+    `webstudio sync --buildId=${buildId} --origin=${BUILDER_INTERNAL_URL} --authToken=${SERVICE_TOKEN}`
+  );
+
+  // 2. Generate Docker project code (react-router-docker template)
+  log(`Generating Docker code for ${domain}...`);
+  await run(`webstudio build --template docker`);
+
+  // 3. Write optimized multi-stage Dockerfile (BuildKit cache mounts)
+  await writeFile(join(workDir, "Dockerfile"), DOCKER_SITE_DOCKERFILE, "utf8");
+  log(`Wrote Dockerfile for ${domain}`);
+
+  // 4. Build image once — shared across all hostnames (@m8jj skip-build pattern)
+  const imageName = toDockerName(domain);
+  log(`Building Docker image ${imageName}...`);
+  await run(`docker build -t ${imageName} .`, { DOCKER_BUILDKIT: "1" });
+
+  // 5. Allocate a single host port for this domain
+  const port = allocateDockerPort(domain);
+  const containerName = imageName;
+
+  // 6. Stop/remove old container + start fresh one
+  log(`Deploying container ${containerName} on port ${port}...`);
+  try { await run(`docker stop ${containerName}`); } catch {}
+  try { await run(`docker rm ${containerName}`); } catch {}
+  await run(
+    `docker run -p ${port}:3000 -d --restart=unless-stopped --name ${containerName} ${imageName}`
+  );
+
+  // 7. Prune dangling images from previous builds
+  try { await run(`docker image prune -f`); } catch {}
+
+  // 8. Persist state
+  await writeFile(
+    join(workDir, "state.json"),
+    JSON.stringify({ mode: "docker", port, imageName, containerName, publishDomain, customDomains }, null, 2) + "\n",
+    "utf8"
+  );
+
+  // 9. Register all hostnames → same port in the proxy (one container serves all)
+  const allHostnames = [publishDomain, ...customDomains];
+  for (const hostname of allHostnames) {
+    ssrHostPort.set(hostname, port);
+    await writeTraefikRouteForDomain(hostname);
+  }
+
+  log(`Successfully published Docker site ${domain} (container ${containerName}, port ${port})`);
+};
+
 // ─── Site proxy (SSR + SSG) ───────────────────────────────────────────────────
 
 /**
