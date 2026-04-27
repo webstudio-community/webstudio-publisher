@@ -10,6 +10,30 @@ Service Node.js (ESM, no build step) qui publie les sites lors d'une publication
 
 Le champ `buildMode` dans le body du `POST /publish` détermine la destination (défaut: `"ssg"`).
 
+### `ssr` — Container Docker par domaine
+
+```
+POST /publish { buildId, builderOrigin, buildMode: "ssr" }
+  → webstudio sync --buildId --origin --authToken
+  → webstudio build --template docker
+  → écriture de DOCKER_SITE_DOCKERFILE dans workDir/Dockerfile
+  → DOCKER_BUILDKIT=1 docker build -t <ws-domain> .   ← une seule fois
+  → docker stop/rm <container> ; docker run -p PORT:3000 -d --restart=unless-stopped
+  → docker image prune -f
+  → state.json { mode: "docker", port, imageName, containerName, publishDomain, customDomains }
+  → tous les hostnames (publishDomain + customDomains) enregistrés dans ssrHostPort
+```
+
+**Infra requise** : monter `/var/run/docker.sock` dans le container publisher.
+Un warning est loggé au démarrage si le socket n'est pas accessible.
+
+**Ports** : range `DOCKER_PORT_BASE+1…` (défaut 6001+).
+Un seul container par domaine — tous les custom domains sont proxiés vers le même port.
+
+**Optimisations** (`DOCKER_SITE_DOCKERFILE`) :
+- Build multi-stage : prod deps uniquement dans l'image finale
+- Cache mounts BuildKit sur `/root/.npm` → pas de re-download entre les republications
+
 ### `ssg` — Nginx / proxy local (défaut)
 
 ```
@@ -80,6 +104,7 @@ Les ports sont alloués dynamiquement à partir de `SSR_PORT_BASE + 1` (défaut:
 | `PORT` | Port de l'API build (défaut: 4000) |
 | `PROXY_PORT` | Port du proxy de sites (défaut: 4001) |
 | `SSR_PORT_BASE` | Base des ports subprocess SSR (défaut: 5000 → premiers sites sur 5001, 5002…) |
+| `DOCKER_PORT_BASE` | Base des ports containers Docker (défaut: 6000 → premiers sites sur 6001, 6002…) |
 | `CLOUDFLARE_API_TOKEN` | Token Wrangler pour deploy CF Pages (mode `cloudflare`) |
 | `CLOUDFLARE_ACCOUNT_ID` | ID compte Cloudflare (mode `cloudflare`) |
 
