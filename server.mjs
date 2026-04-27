@@ -461,14 +461,14 @@ FROM node:22-alpine AS dependencies-env
 COPY package.json /app/
 WORKDIR /app
 RUN --mount=type=cache,target=/root/.npm \\
-    npm install --package-lock-only
+    npm install --package-lock-only --legacy-peer-deps
 RUN --mount=type=cache,target=/root/.npm \\
-    npm ci --prefer-offline --omit=dev
+    npm ci --prefer-offline --omit=dev --legacy-peer-deps
 
 FROM dependencies-env AS build-env
 WORKDIR /app
 RUN --mount=type=cache,target=/root/.npm \\
-    npm ci --prefer-offline
+    npm ci --prefer-offline --legacy-peer-deps
 COPY . /app/
 RUN --mount=type=cache,target=/root/.npm \\
     npm run build
