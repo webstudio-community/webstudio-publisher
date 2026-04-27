@@ -10,10 +10,10 @@ Service Node.js (ESM, no build step) qui publie les sites lors d'une publication
 
 Le champ `buildMode` dans le body du `POST /publish` détermine la destination (défaut: `"ssg"`).
 
-### `docker` — Container Docker par domaine
+### `ssr` — Container Docker par domaine
 
 ```
-POST /publish { buildId, builderOrigin, buildMode: "docker" }
+POST /publish { buildId, builderOrigin, buildMode: "ssr" }
   → webstudio sync --buildId --origin --authToken
   → webstudio build --template docker
   → écriture de DOCKER_SITE_DOCKERFILE dans workDir/Dockerfile
@@ -27,7 +27,7 @@ POST /publish { buildId, builderOrigin, buildMode: "docker" }
 **Infra requise** : monter `/var/run/docker.sock` dans le container publisher.
 Un warning est loggé au démarrage si le socket n'est pas accessible.
 
-**Ports** : range `DOCKER_PORT_BASE+1…` (défaut 6001+), séparé du range SSR (5001+).
+**Ports** : range `DOCKER_PORT_BASE+1…` (défaut 6001+).
 Un seul container par domaine — tous les custom domains sont proxiés vers le même port.
 
 **Optimisations** (`DOCKER_SITE_DOCKERFILE`) :

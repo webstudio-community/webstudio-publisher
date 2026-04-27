@@ -7,11 +7,10 @@
  * Build modes (POST /publish { buildId, builderOrigin, buildMode }):
  *   ssg        — Vite prerender → static files in /var/publish/<domain>/
  *   cloudflare — React Router build + wrangler pages deploy
- *   ssr        — React Router build → react-router-serve subprocess + proxy on PROXY_PORT
- *   docker     — React Router build → docker build + docker run, one container per domain
+ *   ssr        — React Router build → docker build + docker run, one container per domain
  *
  * SSR proxy (port PROXY_PORT, default 4001):
- *   Serves all published sites — SSR domains are proxied to their subprocess,
+ *   Serves all published sites — SSR domains are proxied to their Docker container,
  *   SSG domains are served directly from /var/publish/<domain>/.
  *   The self-host stack should route *.PUBLISHER_HOST traffic to this port.
  *
@@ -45,9 +44,6 @@ const CF_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID ?? "";
 const BUILDER_INTERNAL_URL = process.env.BUILDER_INTERNAL_URL ?? "http://app:3000";
 const PUBLISH_DIR = "/var/publish";
 const WORK_DIR = "/var/work";
-// Shared node_modules seed — all SSR domains use the same template = same deps.
-// First domain installs via npm; subsequent domains clone via hardlinks (~instant).
-const SSR_SEED_DIR = join(WORK_DIR, ".ssr-seed");
 // When set, the publisher writes a per-domain Traefik dynamic config file so
 // Traefik can request a Let's Encrypt certificate for each custom domain.
 // Mount /data/coolify/proxy/dynamic into the container and set this to that path.
@@ -724,163 +720,7 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
   log(`Successfully published ${domain}`);
 };
 
-/**
- * Build an SSR site using the react-router-docker template and start a
- * react-router-serve subprocess. The site is served via the proxy on PROXY_PORT.
- *
- * Workflow:
- *   1. webstudio sync
- *   2. webstudio build --template docker
- *   3. npm install (first time, or if switching from SSG)
- *   4. npm run build  (react-router build → build/server/index.js)
- *   5. start/restart react-router-serve on allocated port
- */
-/**
- * Install SSR dependencies for a domain workDir.
- *
- * All SSR domains are scaffolded from the same react-router-docker template and
- * end up with an identical package.json. To avoid a full npm install for every
- * new domain we keep a seed at SSR_SEED_DIR:
- *   - First call: runs npm install, then hard-links node_modules into the seed.
- *   - Subsequent calls: clones the seed via cp -al (hardlinks — near-instant,
- *     no extra disk space, same /var/work volume so same filesystem).
- * The seed is invalidated when package.json changes (e.g. webstudio CLI update).
- */
-const installSsrDeps = async (workDir, run) => {
-  const nodeModulesPath = join(workDir, "node_modules");
-  const seedNodeModules = join(SSR_SEED_DIR, "node_modules");
-  const seedPkg = join(SSR_SEED_DIR, "package.json");
-  const currentPkg = join(workDir, "package.json");
-
-  let seedValid = false;
-  if (await pathExists(seedNodeModules) && await pathExists(seedPkg)) {
-    try {
-      const [a, b] = await Promise.all([
-        readFile(seedPkg, "utf8"),
-        readFile(currentPkg, "utf8"),
-      ]);
-      seedValid = a === b;
-    } catch { /* seed check failed — fall through to full install */ }
-  }
-
-  if (seedValid) {
-    log(`Cloning deps from seed via hardlinks...`);
-    await execAsync(`cp -al "${seedNodeModules}" "${nodeModulesPath}"`);
-    return;
-  }
-
-  await run(`npm install`);
-
-  // Save or refresh the seed
-  log(`Saving deps seed for future installs...`);
-  await mkdir(SSR_SEED_DIR, { recursive: true });
-  if (await pathExists(seedNodeModules)) {
-    await rm(seedNodeModules, { recursive: true, force: true });
-  }
-  await execAsync(`cp -al "${nodeModulesPath}" "${seedNodeModules}"`);
-  await cp(currentPkg, seedPkg);
-};
-
-const publishBuildSsr = async ({ buildId }) => {
-  log(`Starting SSR publish for build ${buildId}`);
-
-  const { projectDomain: domain, customDomains } = await getProjectBuildInfo(buildId);
-  log(`Project domain: ${domain}`);
-  if (customDomains.length > 0) {
-    log(`Custom domains: ${customDomains.join(", ")}`);
-  }
-
-  const publishDomain =
-    !domain.includes(".") && PUBLISHER_HOST
-      ? `${domain}.${PUBLISHER_HOST}`
-      : domain;
-
-  const workDir = join(WORK_DIR, domain);
-  await mkdir(workDir, { recursive: true });
-
-  const run = async (cmd) => {
-    log(`  $ ${cmd}`);
-    const { stdout, stderr } = await execAsync(cmd, {
-      cwd: workDir,
-      maxBuffer: 10 * 1024 * 1024,
-    });
-    if (stdout) log(`  stdout: ${stdout.trim()}`);
-    if (stderr) log(`  stderr: ${stderr.trim()}`);
-  };
-
-  // 1. Sync build data
-  log(`Syncing build data for ${domain}...`);
-  await run(
-    `webstudio sync --buildId=${buildId} --origin=${BUILDER_INTERNAL_URL} --authToken=${SERVICE_TOKEN}`
-  );
-
-  // 2. Generate SSR code with Docker template (react-router-docker)
-  log(`Generating SSR code for ${domain}...`);
-  await run(`webstudio build --template docker`);
-
-  // 3. Install dependencies.
-  // Force a clean install when switching from SSG or Docker: incompatible templates.
-  const nodeModulesPath = join(workDir, "node_modules");
-  const stateFile = join(workDir, "state.json");
-
-  let prevState = null;
-  try { prevState = JSON.parse(await readFile(stateFile, "utf8")); } catch {}
-
-  if (prevState?.mode === "docker") {
-    await stopDockerForDomain(domain, prevState.containerName, prevState.publishDomain, prevState.customDomains ?? []);
-  }
-
-  const wasSsg = await pathExists(join(workDir, "dist", "client"));
-  const wasDocker = prevState?.mode === "docker";
-  if (wasSsg || wasDocker) {
-    log(`Detected previous ${wasDocker ? "Docker" : "SSG"} build — clearing node_modules for clean SSR install`);
-    await rm(nodeModulesPath, { recursive: true, force: true });
-    if (wasSsg) {
-      const publishDestDir = join(PUBLISH_DIR, publishDomain);
-      if (await pathExists(publishDestDir)) {
-        await rm(publishDestDir, { recursive: true, force: true });
-        log(`Removed stale SSG output at ${publishDestDir}`);
-      }
-    }
-  }
-
-  if (!(await pathExists(nodeModulesPath))) {
-    log(`Installing dependencies for ${domain}...`);
-    await installSsrDeps(workDir, run);
-  }
-
-  // 4. Build
-  log(`Building SSR bundle for ${domain}...`);
-  await run(`npm run build`);
-
-  const serverEntry = join(workDir, "build", "server", "index.js");
-  if (!(await pathExists(serverEntry))) {
-    throw new Error(`SSR build produced no server entry. Expected: ${serverEntry}`);
-  }
-
-  // 5. Allocate port + persist state so the process is restored on container restart
-  const port = allocateSsrPort(domain);
-  await writeFile(
-    join(workDir, "state.json"),
-    JSON.stringify({ mode: "ssr", port, publishDomain, customDomains }, null, 2) + "\n",
-    "utf8"
-  );
-
-  // 6. Register host → port mappings for the proxy
-  ssrHostPort.set(publishDomain, port);
-  for (const cd of customDomains) {
-    ssrHostPort.set(cd, port);
-    await writeTraefikRouteForDomain(cd);
-  }
-
-  // 7. Start (or hot-swap) the SSR subprocess — old process keeps serving during build
-  log(`Starting SSR process for ${domain} on port ${port}...`);
-  startSsrProcess(domain, workDir, port);
-
-  log(`Successfully published SSR site ${domain} (subprocess port ${port})`);
-};
-
-// ─── Docker mode: build pipeline ─────────────────────────────────────────────
+// ─── SSR build pipeline (Docker containers) ──────────────────────────────────
 
 /**
  * Sanitize a domain slug into a valid Docker image/container name.
@@ -895,18 +735,18 @@ const toDockerName = (domain) =>
     .replace(/^-+|-+$/g, "");
 
 /**
- * Build an SSR site as a Docker container per domain.
+ * Publish an SSR site as an isolated Docker container.
  *
  * Workflow:
  *   1. webstudio sync
  *   2. webstudio build --template docker
  *   3. Write DOCKER_SITE_DOCKERFILE into workDir
  *   4. docker build -t <image> .   ← built ONCE, reused for all hostnames
- *   5. For each hostname: docker stop/rm (ignore errors) + docker run -p PORT:3000
+ *   5. docker stop/rm old container + docker run new one
  *   6. docker image prune -f
  *   7. Persist state.json + register all hostnames in ssrHostPort (proxy reuse)
  */
-const publishBuildDocker = async ({ buildId }) => {
+const publishBuildSsr = async ({ buildId }) => {
   log(`Starting Docker publish for build ${buildId}`);
 
   const { projectDomain: domain, customDomains } = await getProjectBuildInfo(buildId);
@@ -1072,7 +912,7 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      if (buildMode !== "ssg" && buildMode !== "cloudflare" && buildMode !== "ssr" && buildMode !== "docker") {
+      if (buildMode !== "ssg" && buildMode !== "cloudflare" && buildMode !== "ssr") {
         res.writeHead(400);
         res.end(`Unknown buildMode: ${buildMode}`);
         return;
@@ -1094,9 +934,7 @@ const server = createServer(async (req, res) => {
           ? () => publishBuildCloudflare({ buildId })
           : buildMode === "ssr"
             ? () => publishBuildSsr({ buildId })
-            : buildMode === "docker"
-              ? () => publishBuildDocker({ buildId })
-              : () => publishBuild({ buildId, builderOrigin });
+            : () => publishBuild({ buildId, builderOrigin });
 
       q.current = q.current
         .then(job)
