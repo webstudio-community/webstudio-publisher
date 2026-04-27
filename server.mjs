@@ -8,6 +8,7 @@
  *   ssg        — Vite prerender → static files in /var/publish/<domain>/
  *   cloudflare — React Router build + wrangler pages deploy
  *   ssr        — React Router build → react-router-serve subprocess + proxy on PROXY_PORT
+ *   docker     — React Router build → docker build + docker run, one container per domain
  *
  * SSR proxy (port PROXY_PORT, default 4001):
  *   Serves all published sites — SSR domains are proxied to their subprocess,
@@ -1071,7 +1072,7 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      if (buildMode !== "ssg" && buildMode !== "cloudflare" && buildMode !== "ssr") {
+      if (buildMode !== "ssg" && buildMode !== "cloudflare" && buildMode !== "ssr" && buildMode !== "docker") {
         res.writeHead(400);
         res.end(`Unknown buildMode: ${buildMode}`);
         return;
@@ -1093,7 +1094,9 @@ const server = createServer(async (req, res) => {
           ? () => publishBuildCloudflare({ buildId })
           : buildMode === "ssr"
             ? () => publishBuildSsr({ buildId })
-            : () => publishBuild({ buildId, builderOrigin });
+            : buildMode === "docker"
+              ? () => publishBuildDocker({ buildId })
+              : () => publishBuild({ buildId, builderOrigin });
 
       q.current = q.current
         .then(job)
@@ -1125,6 +1128,13 @@ const server = createServer(async (req, res) => {
 });
 
 // ─── Startup ──────────────────────────────────────────────────────────────────
+
+// Warn if Docker socket is not accessible (buildMode: "docker" will fail at publish time)
+try {
+  await execAsync("docker info");
+} catch {
+  logErr("Warning: Docker socket not accessible — buildMode 'docker' will not work. Mount /var/run/docker.sock into this container.");
+}
 
 await restoreSsrProcesses();
 
