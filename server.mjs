@@ -19,8 +19,8 @@
  *   BUILDER_INTERNAL_URL   — internal Docker URL for the builder (default: http://app:3000)
  *   PORT                   — build API HTTP port (default: 4000)
  *   PROXY_PORT             — site proxy HTTP port (default: 4001)
- *   SSR_PORT_BASE          — base port for react-router-serve subprocesses (default: 5000)
- *                            ports 5001, 5002… are assigned per domain
+ *   SSR_PORT_BASE          — base port for legacy SSR subprocesses (default: 5000)
+ *   DOCKER_NETWORK         — Docker network shared with site containers (required for SSR mode)
  */
 
 import { createServer, request as httpRequest } from "node:http";
@@ -48,9 +48,10 @@ const WORK_DIR = "/var/work";
 // Traefik can request a Let's Encrypt certificate for each custom domain.
 // Mount /data/coolify/proxy/dynamic into the container and set this to that path.
 const TRAEFIK_DYNAMIC_DIR = process.env.TRAEFIK_DYNAMIC_DIR ?? "";
-// Base port for Docker site containers. Each domain gets PORT_BASE+n (6001, 6002…).
-// Persisted in state.json so ports survive publisher restarts.
-const DOCKER_PORT_BASE = parseInt(process.env.DOCKER_PORT_BASE ?? "6000");
+// Docker network shared between the publisher and site containers.
+// Auto-detected at startup from the publisher container's own networks.
+// Override with DOCKER_NETWORK env var if auto-detection picks the wrong one.
+let DOCKER_NETWORK = process.env.DOCKER_NETWORK ?? "";
 
 const log = (msg) => console.info(`[publisher] ${msg}`);
 const logErr = (msg) => console.error(`[publisher] ${msg}`);
@@ -134,9 +135,8 @@ const stopDockerForDomain = async (domain, containerName, publishDomain, customD
   log(`Stopping Docker container ${containerName} for ${domain}`);
   try { await execAsync(`docker stop ${containerName}`); } catch {}
   try { await execAsync(`docker rm ${containerName}`); } catch {}
-  ssrHostPort.delete(publishDomain);
-  for (const cd of customDomains) ssrHostPort.delete(cd);
-  dockerDomainPort.delete(domain);
+  dockerHostContainer.delete(publishDomain);
+  for (const cd of customDomains) dockerHostContainer.delete(cd);
 };
 
 /**
@@ -198,12 +198,10 @@ const restoreSsrProcesses = async () => {
           }
         }
 
-        dockerDomainPort.set(domain, port);
-        if (port >= nextDockerPort) nextDockerPort = port + 1;
-        ssrHostPort.set(publishDomain, port);
-        for (const cd of customDomains) ssrHostPort.set(cd, port);
+        dockerHostContainer.set(publishDomain, containerName);
+        for (const cd of customDomains) dockerHostContainer.set(cd, containerName);
 
-        log(`Restored Docker container ${containerName} for ${domain} (port ${port})`);
+        log(`Restored Docker container ${containerName} for ${domain}`);
       }
     } catch {
       // No state.json or invalid JSON — skip
@@ -445,18 +443,11 @@ const patchDataFilesForPrerender = async (dir) => {
   }
 };
 
-// ─── Docker mode: port management ────────────────────────────────────────────
+// ─── Docker mode: container routing ──────────────────────────────────────────
 
-// domain (project slug) → allocated host port
-const dockerDomainPort = new Map();
-let nextDockerPort = DOCKER_PORT_BASE + 1;
-
-const allocateDockerPort = (domain) => {
-  if (dockerDomainPort.has(domain)) return dockerDomainPort.get(domain);
-  const port = nextDockerPort++;
-  dockerDomainPort.set(domain, port);
-  return port;
-};
+// hostname (publishDomain or customDomain) → Docker container name
+// The proxy connects to <containerName>:3000 on DOCKER_NETWORK.
+const dockerHostContainer = new Map();
 
 // ─── Docker mode: site Dockerfile template ───────────────────────────────────
 
@@ -810,36 +801,33 @@ const publishBuildSsr = async ({ buildId }) => {
   log(`Building Docker image ${imageName}...`);
   await run(`docker build -t ${imageName} .`, { DOCKER_BUILDKIT: "1" });
 
-  // 5. Allocate a single host port for this domain
-  const port = allocateDockerPort(domain);
+  // 5. Stop/remove old container + start fresh one on the shared Docker network
   const containerName = imageName;
-
-  // 6. Stop/remove old container + start fresh one
-  log(`Deploying container ${containerName} on port ${port}...`);
+  log(`Deploying container ${containerName}...`);
   try { await run(`docker stop ${containerName}`); } catch {}
   try { await run(`docker rm ${containerName}`); } catch {}
   await run(
-    `docker run -p ${port}:3000 -d --restart=unless-stopped --name ${containerName} ${imageName}`
+    `docker run -d --restart=unless-stopped --network=${DOCKER_NETWORK} --name ${containerName} ${imageName}`
   );
 
-  // 7. Prune dangling images from previous builds
+  // 6. Prune dangling images from previous builds
   try { await run(`docker image prune -f`); } catch {}
 
-  // 8. Persist state
+  // 7. Persist state
   await writeFile(
     join(workDir, "state.json"),
-    JSON.stringify({ mode: "docker", port, imageName, containerName, publishDomain, customDomains }, null, 2) + "\n",
+    JSON.stringify({ mode: "docker", imageName, containerName, publishDomain, customDomains }, null, 2) + "\n",
     "utf8"
   );
 
-  // 9. Register all hostnames → same port in the proxy (one container serves all)
+  // 8. Register all hostnames → container name in the proxy (container:3000 on DOCKER_NETWORK)
   const allHostnames = [publishDomain, ...customDomains];
   for (const hostname of allHostnames) {
-    ssrHostPort.set(hostname, port);
+    dockerHostContainer.set(hostname, containerName);
     await writeTraefikRouteForDomain(hostname);
   }
 
-  log(`Successfully published Docker site ${domain} (container ${containerName}, port ${port})`);
+  log(`Successfully published Docker site ${domain} (container ${containerName})`);
 };
 
 // ─── Site proxy (SSR + SSG) ───────────────────────────────────────────────────
@@ -854,7 +842,34 @@ const publishBuildSsr = async ({ buildId }) => {
 const proxyServer = createServer(async (req, res) => {
   const host = (req.headers["x-forwarded-host"] ?? req.headers.host ?? "").split(":")[0];
 
-  // SSR: proxy to the react-router-serve subprocess
+  // Docker SSR: proxy to container by name on DOCKER_NETWORK (port 3000)
+  const dockerContainer = dockerHostContainer.get(host);
+  if (dockerContainer !== undefined) {
+    const proxyReq = httpRequest(
+      {
+        hostname: dockerContainer,
+        port: 3000,
+        path: req.url,
+        method: req.method,
+        headers: { ...req.headers, host },
+      },
+      (proxyRes) => {
+        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+        proxyRes.pipe(res, { end: true });
+      }
+    );
+    proxyReq.on("error", (err) => {
+      logErr(`Docker proxy error for ${host} → ${dockerContainer}: ${err.message}`);
+      if (!res.headersSent) {
+        res.writeHead(502);
+        res.end("Docker proxy error");
+      }
+    });
+    req.pipe(proxyReq, { end: true });
+    return;
+  }
+
+  // Legacy SSR subprocess: proxy to react-router-serve on 127.0.0.1
   const ssrPort = ssrHostPort.get(host);
   if (ssrPort !== undefined) {
     const proxyReq = httpRequest(
@@ -967,11 +982,30 @@ const server = createServer(async (req, res) => {
 
 // ─── Startup ──────────────────────────────────────────────────────────────────
 
-// Warn if Docker socket is not accessible (buildMode: "docker" will fail at publish time)
+// Check Docker socket + auto-detect DOCKER_NETWORK if not explicitly set
 try {
   await execAsync("docker info");
 } catch {
-  logErr("Warning: Docker socket not accessible — buildMode 'docker' will not work. Mount /var/run/docker.sock into this container.");
+  logErr("Warning: Docker socket not accessible — buildMode 'ssr' will not work. Mount /var/run/docker.sock into this container.");
+}
+
+if (!DOCKER_NETWORK) {
+  try {
+    const hostname = process.env.HOSTNAME ?? "";
+    const { stdout } = await execAsync(
+      `docker inspect --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' ${hostname}`
+    );
+    const networks = stdout.trim().replace(/'/g, "").split(/\s+/)
+      .filter((n) => n && n !== "bridge" && n !== "host" && n !== "none");
+    if (networks.length >= 1) {
+      DOCKER_NETWORK = networks[0];
+      log(`Auto-detected Docker network: ${DOCKER_NETWORK}${networks.length > 1 ? ` (others: ${networks.slice(1).join(", ")}) — set DOCKER_NETWORK to override` : ""}`);
+    } else {
+      logErr("Warning: could not detect a Docker network — SSR containers won't be reachable. Set DOCKER_NETWORK env var.");
+    }
+  } catch {
+    logErr("Warning: DOCKER_NETWORK auto-detection failed — set DOCKER_NETWORK env var manually.");
+  }
 }
 
 await restoreSsrProcesses();
