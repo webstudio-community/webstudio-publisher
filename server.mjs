@@ -130,6 +130,19 @@ const stopSsrForDomain = (domain, publishDomain, customDomains) => {
 };
 
 /**
+ * Stop a running Docker container and remove its proxy routing entries.
+ * Called on mode switches away from docker (→ ssg, → ssr, → cloudflare).
+ */
+const stopDockerForDomain = async (domain, containerName, publishDomain, customDomains) => {
+  log(`Stopping Docker container ${containerName} for ${domain}`);
+  try { await execAsync(`docker stop ${containerName}`); } catch {}
+  try { await execAsync(`docker rm ${containerName}`); } catch {}
+  ssrHostPort.delete(publishDomain);
+  for (const cd of customDomains) ssrHostPort.delete(cd);
+  dockerDomainPort.delete(domain);
+};
+
+/**
  * On publisher startup, read state.json files and restart any SSR processes.
  */
 const restoreSsrProcesses = async () => {
@@ -565,16 +578,19 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
   const workDir = join(WORK_DIR, domain);
   await mkdir(workDir, { recursive: true });
 
-  // Stop any running SSR process for this domain (mode switch SSR→SSG)
+  // Handle mode transitions → ssg
   const stateFile = join(workDir, "state.json");
   try {
     const prevState = JSON.parse(await readFile(stateFile, "utf8"));
     if (prevState.mode === "ssr") {
       stopSsrForDomain(domain, prevState.publishDomain, prevState.customDomains ?? []);
       await rm(stateFile, { force: true });
+    } else if (prevState.mode === "docker") {
+      await stopDockerForDomain(domain, prevState.containerName, prevState.publishDomain, prevState.customDomains ?? []);
+      await rm(stateFile, { force: true });
     }
   } catch {
-    // No state.json or not SSR — nothing to stop
+    // No state.json or unknown mode — nothing to stop
   }
 
   const run = async (cmd) => {
@@ -772,18 +788,28 @@ const publishBuildSsr = async ({ buildId }) => {
   await run(`webstudio build --template docker`);
 
   // 3. Install dependencies.
-  // Force a clean install when switching from SSG: vike/SSG deps are incompatible
-  // with the react-router template, and the old dist/client dir signals a prior SSG build.
+  // Force a clean install when switching from SSG or Docker: incompatible templates.
   const nodeModulesPath = join(workDir, "node_modules");
+  const stateFile = join(workDir, "state.json");
+
+  let prevState = null;
+  try { prevState = JSON.parse(await readFile(stateFile, "utf8")); } catch {}
+
+  if (prevState?.mode === "docker") {
+    await stopDockerForDomain(domain, prevState.containerName, prevState.publishDomain, prevState.customDomains ?? []);
+  }
+
   const wasSsg = await pathExists(join(workDir, "dist", "client"));
-  if (wasSsg) {
-    log(`Detected previous SSG build — clearing node_modules for clean SSR install`);
+  const wasDocker = prevState?.mode === "docker";
+  if (wasSsg || wasDocker) {
+    log(`Detected previous ${wasDocker ? "Docker" : "SSG"} build — clearing node_modules for clean SSR install`);
     await rm(nodeModulesPath, { recursive: true, force: true });
-    // Remove stale SSG static output so the proxy stops serving it
-    const publishDestDir = join(PUBLISH_DIR, publishDomain);
-    if (await pathExists(publishDestDir)) {
-      await rm(publishDestDir, { recursive: true, force: true });
-      log(`Removed stale SSG output at ${publishDestDir}`);
+    if (wasSsg) {
+      const publishDestDir = join(PUBLISH_DIR, publishDomain);
+      if (await pathExists(publishDestDir)) {
+        await rm(publishDestDir, { recursive: true, force: true });
+        log(`Removed stale SSG output at ${publishDestDir}`);
+      }
     }
   }
 
@@ -876,6 +902,23 @@ const publishBuildDocker = async ({ buildId }) => {
     if (stdout) log(`  stdout: ${stdout.trim()}`);
     if (stderr) log(`  stderr: ${stderr.trim()}`);
   };
+
+  // Handle mode transitions → docker
+  const stateFile = join(workDir, "state.json");
+  try {
+    const prevState = JSON.parse(await readFile(stateFile, "utf8"));
+    if (prevState.mode === "ssg") {
+      // Remove stale static files so the proxy stops serving them directly
+      for (const h of [prevState.publishDomain ?? publishDomain, ...(prevState.customDomains ?? [])]) {
+        await rm(join(PUBLISH_DIR, h), { recursive: true, force: true });
+      }
+      log(`Removed stale SSG output for ${domain}`);
+    } else if (prevState.mode === "ssr") {
+      stopSsrForDomain(domain, prevState.publishDomain, prevState.customDomains ?? []);
+      log(`Stopped SSR process for ${domain} (switching to Docker)`);
+    }
+    // mode: "docker" → old container is stopped in step 6 below
+  } catch { /* no state.json — new domain */ }
 
   // 1. Sync build data
   log(`Syncing build data for ${domain}...`);
