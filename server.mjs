@@ -51,6 +51,9 @@ const SSR_SEED_DIR = join(WORK_DIR, ".ssr-seed");
 // Traefik can request a Let's Encrypt certificate for each custom domain.
 // Mount /data/coolify/proxy/dynamic into the container and set this to that path.
 const TRAEFIK_DYNAMIC_DIR = process.env.TRAEFIK_DYNAMIC_DIR ?? "";
+// Base port for Docker site containers. Each domain gets PORT_BASE+n (6001, 6002…).
+// Persisted in state.json so ports survive publisher restarts.
+const DOCKER_PORT_BASE = parseInt(process.env.DOCKER_PORT_BASE ?? "6000");
 
 const log = (msg) => console.info(`[publisher] ${msg}`);
 const logErr = (msg) => console.error(`[publisher] ${msg}`);
@@ -401,6 +404,51 @@ const patchDataFilesForPrerender = async (dir) => {
     }
   }
 };
+
+// ─── Docker mode: port management ────────────────────────────────────────────
+
+// domain (project slug) → allocated host port
+const dockerDomainPort = new Map();
+let nextDockerPort = DOCKER_PORT_BASE + 1;
+
+const allocateDockerPort = (domain) => {
+  if (dockerDomainPort.has(domain)) return dockerDomainPort.get(domain);
+  const port = nextDockerPort++;
+  dockerDomainPort.set(domain, port);
+  return port;
+};
+
+// ─── Docker mode: site Dockerfile template ───────────────────────────────────
+
+// Multi-stage Dockerfile written into each domain's workDir before `docker build`.
+// Adapted from @m8jj's template for the react-router-docker webstudio template:
+//   - npm layer cache via BuildKit cache mounts (requires DOCKER_BUILDKIT=1)
+//   - prod-only deps in the final image (--omit=dev)
+//   - build output: build/server/ + build/client/ (no public/ — included in build/client/)
+const DOCKER_SITE_DOCKERFILE = `\
+FROM node:22-alpine AS dependencies-env
+COPY package.json /app/
+WORKDIR /app
+RUN --mount=type=cache,target=/root/.npm \\
+    npm install --package-lock-only
+RUN --mount=type=cache,target=/root/.npm \\
+    npm ci --prefer-offline --omit=dev
+
+FROM dependencies-env AS build-env
+WORKDIR /app
+RUN --mount=type=cache,target=/root/.npm \\
+    npm ci --prefer-offline
+COPY . /app/
+RUN --mount=type=cache,target=/root/.npm \\
+    npm run build
+
+FROM node:22-alpine
+COPY package.json /app/
+COPY --from=dependencies-env /app/node_modules /app/node_modules
+COPY --from=build-env /app/build /app/build
+WORKDIR /app
+CMD ["npm", "run", "start"]
+`;
 
 /**
  * Sanitize a domain into a valid Cloudflare Pages project name.
