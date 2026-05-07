@@ -470,6 +470,7 @@ WORKDIR /app
 RUN --mount=type=cache,target=/root/.npm \\
     npm ci --prefer-offline --legacy-peer-deps
 COPY . /app/
+RUN node /app/patch-navlink.cjs
 RUN --mount=type=cache,target=/root/.npm \\
     npm run build
 
@@ -808,6 +809,27 @@ const publishBuildSsr = async ({ buildId }) => {
     await writeFile(imageRoutePath, imageRouteCode, "utf8");
     log(`Patched [_image].$.ts for ${domain}`);
   } catch { /* file absent in older CLI versions — skip */ }
+
+  // 2c. Write NavLink patch script — run inside the Docker build after npm ci to fix
+  // aria-current="page" being applied to all /#section links in SSR. The npm CLI
+  // installs @webstudio-is/sdk-components-react-router from the upstream registry so
+  // we patch its compiled lib/components.js before webpack compiles the site.
+  await writeFile(join(workDir, "patch-navlink.cjs"), `
+const { readFileSync, writeFileSync, existsSync } = require("node:fs");
+const p = "./node_modules/@webstudio-is/sdk-components-react-router/lib/components.js";
+if (!existsSync(p)) { console.log("NavLink patch: file not found, skipping"); process.exit(0); }
+let c = readFileSync(p, "utf8");
+const patched = c.replace(
+  /href\\.startsWith\\("\\/"\\) && href\\.startsWith\\(assetBaseUrl\\) === false(?! && href\\.startsWith\\("\\\/#"\\))/g,
+  'href.startsWith("/") && href.startsWith(assetBaseUrl) === false && href.startsWith("/#") === false'
+);
+if (patched !== c) {
+  writeFileSync(p, patched);
+  console.log("NavLink patch: applied");
+} else {
+  console.log("NavLink patch: pattern not found (already patched or upstream changed)");
+}
+`);
 
   // 3. Write optimized multi-stage Dockerfile (BuildKit cache mounts)
   await writeFile(join(workDir, "Dockerfile"), DOCKER_SITE_DOCKERFILE, "utf8");
