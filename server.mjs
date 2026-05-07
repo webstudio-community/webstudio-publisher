@@ -795,6 +795,20 @@ const publishBuildSsr = async ({ buildId }) => {
   log(`Generating Docker code for ${domain}...`);
   await run(`webstudio build --template docker`);
 
+  // 2b. Patch [_image].$.ts: the npm CLI template uses "./public" as the IPX FS
+  // storage root, but Vite moves public/ assets into build/client/ during build
+  // and public/ is absent from the final multi-stage image.
+  const imageRoutePath = join(workDir, "app/routes/[_image].$.ts");
+  try {
+    let imageRouteCode = await readFile(imageRoutePath, "utf8");
+    imageRouteCode = imageRouteCode.replace(
+      /ipxFSStorage\(\{[^}]*dir:\s*["']\.\/public["'][^}]*\}\)/g,
+      'ipxFSStorage({ dir: "./build/client" })'
+    );
+    await writeFile(imageRoutePath, imageRouteCode, "utf8");
+    log(`Patched [_image].$.ts for ${domain}`);
+  } catch { /* file absent in older CLI versions — skip */ }
+
   // 3. Write optimized multi-stage Dockerfile (BuildKit cache mounts)
   await writeFile(join(workDir, "Dockerfile"), DOCKER_SITE_DOCKERFILE, "utf8");
   log(`Wrote Dockerfile for ${domain}`);
@@ -810,7 +824,7 @@ const publishBuildSsr = async ({ buildId }) => {
   try { await run(`docker stop ${containerName}`); } catch {}
   try { await run(`docker rm ${containerName}`); } catch {}
   await run(
-    `docker run -d --restart=unless-stopped --network=${DOCKER_NETWORK} --name ${containerName} ${imageName}`
+    `docker run -d --restart=unless-stopped --network=${DOCKER_NETWORK} --name ${containerName} -e IPX_HTTP_ALLOW_ALL_DOMAINS=true ${imageName}`
   );
 
   // 6. Prune dangling images from previous builds
