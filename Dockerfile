@@ -5,6 +5,9 @@ FROM node:22-alpine
 RUN npm install -g webstudio@latest
 # wrangler is installed on-demand at first Cloudflare publish (saves ~150 MB for non-CF users)
 
+# docker CLI for buildMode: "docker" — requires /var/run/docker.sock mounted at runtime
+RUN apk add --no-cache docker-cli docker-cli-buildx
+
 WORKDIR /app
 
 COPY server.mjs /app/server.mjs
