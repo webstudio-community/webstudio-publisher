@@ -625,7 +625,10 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
   );
 
   // 2. Generate SSG project code (copies template + generates pages)
+  // Clean stale generated files so renamed/deleted pages don't cause broken imports
   log(`Generating SSG code for ${domain}...`);
+  await rm(join(workDir, "pages"), { recursive: true, force: true });
+  await rm(join(workDir, "app"), { recursive: true, force: true });
   await run(`webstudio build --template ssg`);
 
   // 2b. Pin vike to the exact version the SSG template targets.
