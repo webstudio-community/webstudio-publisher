@@ -2,6 +2,11 @@
 
 Service Node.js (ESM, no build step) qui publie les sites lors d'une publication, avec support multi-destinations.
 
+## Branches
+
+- Branche principale : `main`
+- Toutes les branches de fix/feature partent de `main` et ouvrent une PR vers `main`.
+
 ## Fichier principal
 
 `server.mjs` — tout le service tient dans ce fichier unique. Pas de dépendances npm locales.
