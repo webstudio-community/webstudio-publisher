@@ -284,10 +284,11 @@ const getProjectQueue = (domain) => {
 };
 
 /**
- * Fetch build data from the builder app and extract the project domain + custom domains.
+ * Fetch build data from the builder app via tRPC and extract project domain + custom domains.
  */
 const getProjectBuildInfo = async (buildId) => {
-  const url = new URL(`/rest/build/${buildId}`, BUILDER_INTERNAL_URL);
+  const input = encodeURIComponent(JSON.stringify({ buildId }));
+  const url = new URL(`/trpc/build.loadProjectDataByBuildId?input=${input}`, BUILDER_INTERNAL_URL);
   const response = await fetch(url.href, {
     headers: { Authorization: SERVICE_TOKEN },
   });
@@ -295,8 +296,9 @@ const getProjectBuildInfo = async (buildId) => {
     const text = await response.text();
     throw new Error(`Failed to fetch build ${buildId}: ${text.slice(0, 500)}`);
   }
-  const data = await response.json();
-  if (!data.projectDomain) {
+  const wrapper = await response.json();
+  const data = wrapper?.result?.data;
+  if (!data?.projectDomain) {
     throw new Error(`Build ${buildId} has no projectDomain`);
   }
   return {
