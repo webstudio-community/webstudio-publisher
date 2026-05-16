@@ -796,15 +796,32 @@ const publishBuildSsr = async ({ buildId }) => {
   log(`Generating Docker code for ${domain}...`);
   await run(`webstudio build --template docker`);
 
-  // 2b. Patch [_image].$.ts: the npm CLI template uses "./public" as the IPX FS
-  // storage root, but Vite moves public/ assets into build/client/ during build
-  // and public/ is absent from the final multi-stage image.
+  // 2b. Patch [_image].$.ts:
+  //   - Fix storage root: template uses "./public" but Vite moves assets into
+  //     build/client/ and public/ is absent from the final multi-stage image.
+  //   - Add persistent disk cache: ipxFSCache({ dir: "/var/cache/ipx" }) so
+  //     processed images survive container restarts (volume mounted in docker run).
   const imageRoutePath = join(workDir, "app/routes/[_image].$.ts");
   try {
     let imageRouteCode = await readFile(imageRoutePath, "utf8");
+    // Fix storage root
     imageRouteCode = imageRouteCode.replace(
       /ipxFSStorage\(\{[^}]*dir:\s*["']\.\/public["'][^}]*\}\)/g,
       'ipxFSStorage({ dir: "./build/client" })'
+    );
+    // Add ipxFSCache to the import from "ipx"
+    imageRouteCode = imageRouteCode.replace(
+      /import\s*\{([^}]*)\}\s*from\s*["']ipx["']/,
+      (_, imports) =>
+        imports.includes("ipxFSCache")
+          ? `import {${imports}} from "ipx"`
+          : `import {${imports}, ipxFSCache} from "ipx"`
+    );
+    // Inject cache option into createIPX({ storage: ... })
+    imageRouteCode = imageRouteCode.replace(
+      /(storage:\s*ipxFSStorage\([^)]+\))(\s*\})/,
+      (_, storage, closing) =>
+        `${storage}, cache: ipxFSCache({ dir: "/var/cache/ipx" })${closing}`
     );
     await writeFile(imageRoutePath, imageRouteCode, "utf8");
     log(`Patched [_image].$.ts for ${domain}`);
@@ -846,7 +863,7 @@ if (patched !== c) {
   try { await run(`docker stop ${containerName}`); } catch {}
   try { await run(`docker rm ${containerName}`); } catch {}
   await run(
-    `docker run -d --restart=unless-stopped --network=${DOCKER_NETWORK} --name ${containerName} -e IPX_HTTP_ALLOW_ALL_DOMAINS=true ${imageName}`
+    `docker run -d --restart=unless-stopped --network=${DOCKER_NETWORK} --name ${containerName} -v ${imageName}-ipx-cache:/var/cache/ipx -e IPX_HTTP_ALLOW_ALL_DOMAINS=true ${imageName}`
   );
 
   // 6. Prune dangling images from previous builds
