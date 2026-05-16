@@ -310,7 +310,7 @@ const getProjectBuildInfo = async (buildId) => {
  * Called after the build completes (PUBLISHED) or fails (FAILED).
  */
 const notifyBuildStatus = async (buildId, publishStatus) => {
-  const url = new URL(`/rest/build/${buildId}/status`, BUILDER_INTERNAL_URL);
+  const url = new URL("/trpc/build.updatePublishStatus", BUILDER_INTERNAL_URL);
   try {
     const response = await fetch(url.href, {
       method: "POST",
@@ -318,7 +318,7 @@ const notifyBuildStatus = async (buildId, publishStatus) => {
         "Content-Type": "application/json",
         Authorization: SERVICE_TOKEN,
       },
-      body: JSON.stringify({ publishStatus }),
+      body: JSON.stringify({ buildId, publishStatus }),
     });
     if (!response.ok) {
       const text = await response.text();
