@@ -815,7 +815,7 @@ const publishBuildSsr = async ({ buildId }) => {
       (_, imports) =>
         imports.includes("ipxFSCache")
           ? `import {${imports}} from "ipx"`
-          : `import {${imports}, ipxFSCache} from "ipx"`
+          : `import {${imports.replace(/,?\s*$/, "")},\n  ipxFSCache,\n} from "ipx"`
     );
     // Inject cache option into createIPX({ storage: ... })
     imageRouteCode = imageRouteCode.replace(
