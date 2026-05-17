@@ -16,18 +16,11 @@ jobs:
       packages: write
 
     steps:
-      - name: Compute branch tag
-        id: branch
-        run: |
-          BRANCH="${{ github.head_ref }}"
-          SAFE=$(echo "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/-\+/-/g' | sed 's/^-//;s/-$//')
-          echo "tag=$SAFE" >> "$GITHUB_OUTPUT"
-
-      - name: Delete GHCR image version for branch tag
+      - name: Delete GHCR image version for PR tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OWNER: ${{ github.repository_owner }}
-          TAG: ${{ steps.branch.outputs.tag }}
+          TAG: pr-${{ github.event.pull_request.number }}
         run: |
           VERSIONS=$(curl -fsSL \
             -H "Authorization: Bearer $GH_TOKEN" \
