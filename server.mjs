@@ -699,6 +699,32 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
     throw new Error(`Prerender produced no HTML files. Check vite build output for errors.`);
   }
 
+  // 4b. Fix meta URLs in generated HTML:
+  //   - og:url leaks the Docker-internal origin (e.g. http://app:3000) → replace with public HTTPS domain
+  //   - og:image / twitter:image are relative paths → make absolute for social scrapers
+  const publicOrigin = `https://${publishDomain}`;
+  const fixHtmlMeta = async (dir) => {
+    let entries;
+    try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await fixHtmlMeta(fullPath);
+      } else if (entry.name.endsWith(".html")) {
+        const content = await readFile(fullPath, "utf8");
+        let fixed = content.replaceAll(BUILDER_INTERNAL_URL, publicOrigin);
+        fixed = fixed.replace(/(property="og:image"\s+content=")(\/[^"]*)/g, (_, prefix, path) => `${prefix}${publicOrigin}${path}`);
+        fixed = fixed.replace(/(name="twitter:image"\s+content=")(\/[^"]*)/g, (_, prefix, path) => `${prefix}${publicOrigin}${path}`);
+        if (fixed !== content) {
+          await writeFile(fullPath, fixed, "utf8");
+          log(`  Fixed meta URLs in ${fullPath}`);
+        }
+      }
+    }
+  };
+  log(`Fixing meta URLs in generated HTML...`);
+  await fixHtmlMeta(distDir);
+
   // 5. Copy built files to the serve directory
   const destDir = join(PUBLISH_DIR, publishDomain);
   log(`Publishing ${domain} to ${destDir}...`);
