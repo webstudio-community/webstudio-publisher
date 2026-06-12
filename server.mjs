@@ -654,6 +654,25 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
       needsInstall = true;
     }
   }
+  // Also reinstall when the @webstudio-is/* package versions changed (CLI upgrade).
+  // The exports map of sdk-components-react changes between CLI versions; a stale
+  // node_modules with an old version causes "Missing specifier" errors at build time.
+  if (!needsInstall) {
+    try {
+      const pkg = JSON.parse(await readFile(packageJsonPath, "utf8"));
+      const declaredVersion = pkg.dependencies?.["@webstudio-is/sdk-components-react"];
+      const installedPkg = JSON.parse(
+        await readFile(join(nodeModulesPath, "@webstudio-is/sdk-components-react", "package.json"), "utf8")
+      );
+      if (declaredVersion && installedPkg.version !== declaredVersion) {
+        log(`  @webstudio-is/sdk-components-react ${installedPkg.version} installed but need ${declaredVersion} — reinstalling`);
+        await rm(nodeModulesPath, { recursive: true, force: true });
+        needsInstall = true;
+      }
+    } catch {
+      needsInstall = true;
+    }
+  }
 
   if (needsInstall) {
     const pkg = JSON.parse(await readFile(packageJsonPath, "utf8"));
@@ -699,18 +718,49 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
     throw new Error(`Prerender produced no HTML files. Check vite build output for errors.`);
   }
 
+  // 4b. Fix meta URLs in generated HTML:
+  //   - og:url leaks the Docker-internal origin (e.g. http://app:3000) → replace with public HTTPS domain
+  //   - og:image / twitter:image are relative paths → make absolute for social scrapers
+  const publicOrigin = `https://${publishDomain}`;
+  const transformHtmlFiles = async (dir, transform) => {
+    let entries;
+    try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await transformHtmlFiles(fullPath, transform);
+      } else if (entry.name.endsWith(".html")) {
+        const content = await readFile(fullPath, "utf8");
+        const fixed = transform(content);
+        if (fixed !== content) {
+          await writeFile(fullPath, fixed, "utf8");
+          log(`  Updated meta URLs in ${fullPath}`);
+        }
+      }
+    }
+  };
+  log(`Fixing meta URLs in generated HTML...`);
+  await transformHtmlFiles(distDir, (html) => {
+    let out = html.replaceAll(BUILDER_INTERNAL_URL, publicOrigin);
+    out = out.replace(/(property="og:image"\s+content=")(\/[^"]*)/g, (_, prefix, path) => `${prefix}${publicOrigin}${path}`);
+    out = out.replace(/(name="twitter:image"\s+content=")(\/[^"]*)/g, (_, prefix, path) => `${prefix}${publicOrigin}${path}`);
+    return out;
+  });
+
   // 5. Copy built files to the serve directory
   const destDir = join(PUBLISH_DIR, publishDomain);
   log(`Publishing ${domain} to ${destDir}...`);
   await rm(destDir, { recursive: true, force: true });
   await cp(distDir, destDir, { recursive: true });
 
-  // 5b. Also copy to each verified custom domain directory.
+  // 5b. Also copy to each verified custom domain directory, rewriting og:url to the custom domain.
   for (const customDomain of customDomains) {
     const customDestDir = join(PUBLISH_DIR, customDomain);
     log(`Publishing custom domain ${customDomain} to ${customDestDir}...`);
     await rm(customDestDir, { recursive: true, force: true });
     await cp(distDir, customDestDir, { recursive: true });
+    log(`  Rewriting og:url to https://${customDomain}...`);
+    await transformHtmlFiles(customDestDir, (html) => html.replaceAll(publicOrigin, `https://${customDomain}`));
     await writeTraefikRouteForDomain(customDomain);
   }
 
