@@ -654,6 +654,25 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
       needsInstall = true;
     }
   }
+  // Also reinstall when the @webstudio-is/* package versions changed (CLI upgrade).
+  // The exports map of sdk-components-react changes between CLI versions; a stale
+  // node_modules with an old version causes "Missing specifier" errors at build time.
+  if (!needsInstall) {
+    try {
+      const pkg = JSON.parse(await readFile(packageJsonPath, "utf8"));
+      const declaredVersion = pkg.dependencies?.["@webstudio-is/sdk-components-react"];
+      const installedPkg = JSON.parse(
+        await readFile(join(nodeModulesPath, "@webstudio-is/sdk-components-react", "package.json"), "utf8")
+      );
+      if (declaredVersion && installedPkg.version !== declaredVersion) {
+        log(`  @webstudio-is/sdk-components-react ${installedPkg.version} installed but need ${declaredVersion} — reinstalling`);
+        await rm(nodeModulesPath, { recursive: true, force: true });
+        needsInstall = true;
+      }
+    } catch {
+      needsInstall = true;
+    }
+  }
 
   if (needsInstall) {
     const pkg = JSON.parse(await readFile(packageJsonPath, "utf8"));
