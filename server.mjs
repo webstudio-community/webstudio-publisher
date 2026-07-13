@@ -288,7 +288,7 @@ const getProjectQueue = (domain) => {
  */
 const getProjectBuildInfo = async (buildId) => {
   const input = encodeURIComponent(JSON.stringify({ buildId }));
-  const url = new URL(`/trpc/build.loadProjectDataByBuildId?input=${input}`, BUILDER_INTERNAL_URL);
+  const url = new URL(`/trpc/build.loadProjectBundleByBuildId?input=${input}`, BUILDER_INTERNAL_URL);
   const response = await fetch(url.href, {
     headers: { Authorization: SERVICE_TOKEN },
   });
