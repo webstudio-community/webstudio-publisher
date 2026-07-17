@@ -29,9 +29,26 @@ WORKDIR /src
 RUN git clone --filter=blob:none "$WEBSTUDIO_REPO" . \
  && git checkout "$WEBSTUDIO_REF"
 
+# A from-source build leaves every package at the "0.0.0-webstudio-version"
+# placeholder. Generated sites would then request @webstudio-is/*@0.0.0-webstudio-version
+# from npm — which does not exist — and their `npm install` fails with ETARGET.
+# Stamp a real, published version into every package.json, exactly like the fork's
+# release.yml does. This does NOT affect sync/build compatibility (that is gated by
+# the schema/code, not the version string); it only sets which published
+# @webstudio-is/* packages the generated sites pull at publish time.
+# Defaults to the latest published `webstudio` version if not provided.
+ARG WEBSTUDIO_SDK_VERSION=
+RUN SDK_VERSION="${WEBSTUDIO_SDK_VERSION:-$(npm view webstudio@latest version)}" \
+ && echo "Stamping @webstudio-is/* version: $SDK_VERSION" \
+ && npx --yes replace-in-files-cli \
+      --string="0.0.0-webstudio-version" \
+      --replacement="$SDK_VERSION" \
+      "**/package.json"
+
 # Reuse the pnpm store across builds; the install itself re-runs when the ref moves.
+# --no-frozen-lockfile because the version stamp above edits the manifests.
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
-    pnpm install --frozen-lockfile
+    pnpm install --no-frozen-lockfile
 
 # Build the CLI and all its workspace dependencies (@webstudio-is/*), then emit
 # a self-contained, production-only deployable dir (bin.js + lib + templates +
