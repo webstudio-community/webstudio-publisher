@@ -129,3 +129,30 @@ Les ports sont alloués dynamiquement à partir de `SSR_PORT_BASE + 1` (défaut:
 docker build -t webstudio-publisher .
 # Image publiée sur : ghcr.io/webstudio-community/webstudio-publisher
 ```
+
+### CLI webstudio ↔ lockstep avec le builder (IMPORTANT)
+
+Le handshake `webstudio sync` est verrouillé par un **hash de contrat de bundle** +
+la surface des routes tRPC, tous deux dérivés du schéma du **fork**. Le CLI publié
+sur npm (`webstudio@latest`) est buildé depuis le schéma **upstream** → rejeté par
+l'API du fork (`apiCompatibilityError`).
+
+→ Le `Dockerfile` **build donc le CLI depuis le fork** (stage `cli-build`), au commit
+passé via `--build-arg WEBSTUDIO_REF`. Le CI (`docker-publish.yml`) lit le label
+`org.opencontainers.image.revision` de `ghcr.io/webstudio-community/builder:latest`
+et l'utilise comme ref → le CLI du publisher est toujours au **même commit que le
+builder déployé**. Ne jamais revenir à `npm install -g webstudio@latest`.
+
+### Version des packages `@webstudio-is/*` stampée (`WEBSTUDIO_SDK_VERSION`)
+
+Buildé depuis les sources, le CLI garde le placeholder `0.0.0-webstudio-version`.
+Les sites générés déclareraient alors `@webstudio-is/*@0.0.0-webstudio-version` →
+`npm install` échoue (`ETARGET`, version inexistante sur npm).
+
+→ Le stage `cli-build` **remplace** ce placeholder par une vraie version publiée
+dans tous les `package.json` (même étape que `release.yml` du fork), avant install.
+Par défaut = `npm view webstudio@latest version` (résolu à chaque build d'image),
+surchargeable via `--build-arg WEBSTUDIO_SDK_VERSION=x.y.z`. N'affecte PAS la compat
+sync/build (celle-ci dépend du schéma, pas de la chaîne de version) — fixe seulement
+quel **SDK runtime** publié les sites générés téléchargent. Deux axes distincts :
+le CLI suit le commit du builder, le SDK runtime suit la dernière version npm.
