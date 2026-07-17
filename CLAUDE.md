@@ -129,3 +129,16 @@ Les ports sont alloués dynamiquement à partir de `SSR_PORT_BASE + 1` (défaut:
 docker build -t webstudio-publisher .
 # Image publiée sur : ghcr.io/webstudio-community/webstudio-publisher
 ```
+
+### CLI webstudio ↔ lockstep avec le builder (IMPORTANT)
+
+Le handshake `webstudio sync` est verrouillé par un **hash de contrat de bundle** +
+la surface des routes tRPC, tous deux dérivés du schéma du **fork**. Le CLI publié
+sur npm (`webstudio@latest`) est buildé depuis le schéma **upstream** → rejeté par
+l'API du fork (`apiCompatibilityError`).
+
+→ Le `Dockerfile` **build donc le CLI depuis le fork** (stage `cli-build`), au commit
+passé via `--build-arg WEBSTUDIO_REF`. Le CI (`docker-publish.yml`) lit le label
+`org.opencontainers.image.revision` de `ghcr.io/webstudio-community/builder:latest`
+et l'utilise comme ref → le CLI du publisher est toujours au **même commit que le
+builder déployé**. Ne jamais revenir à `npm install -g webstudio@latest`.
