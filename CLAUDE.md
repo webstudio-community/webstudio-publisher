@@ -70,14 +70,32 @@ La stack self-host doit router `*.PUBLISHER_HOST` vers ce port (voir `webstudio-
 
 ```
 POST /publish { buildId, builderOrigin, buildMode: "cloudflare" }
+  → arrêt du mode précédent (container docker / process ssr) + purge de /var/publish/<hostname>
   → webstudio sync --buildId --origin --authToken
   → webstudio build --template cloudflare
-  → npm install (si node_modules absent)
+  → npm install (si node_modules absent OU appartient à un autre template)
   → npm run build  (remix vite:build → build/client/)
-  → wrangler pages deploy ./build/client --project-name <domain-sanitisé>
+  → wrangler pages project create <domain-sanitisé> --production-branch main   ← si absent
+  → wrangler pages deploy ./build/client --project-name <domain-sanitisé> --branch main
+  → state.json { mode: "cloudflare", cfProjectName, publishDomain, customDomains }
 ```
 
-Requiert `CLOUDFLARE_API_TOKEN` et `CLOUDFLARE_ACCOUNT_ID`. Le projet CF Pages est créé automatiquement par wrangler s'il n'existe pas.
+Requiert `CLOUDFLARE_API_TOKEN` et `CLOUDFLARE_ACCOUNT_ID`.
+
+**Le projet CF Pages n'est PAS créé automatiquement par le deploy.** wrangler 3 le
+faisait ; wrangler 4 a supprimé ce comportement et échoue avec `The Pages project
+"<name>" does not exist`. Le template épingle `wrangler@^3.63.2` en devDependency mais
+`ensureWrangler` installe le dernier wrangler en global, et c'est celui-là qui tourne —
+donc en pratique on est toujours sur le comportement wrangler 4. D'où le
+`pages project create` explicite, qui est correct sur les deux majeures.
+
+`--branch` est explicite parce que `workDir` n'est pas un dépôt git : sans lui wrangler
+ne peut pas déduire qu'il s'agit de la branche de production et le déploiement part en
+preview au lieu de `<project>.pages.dev`.
+
+Le projet Pages n'est jamais supprimé par le publisher — ni sur changement de mode, ni
+sur unpublish. C'est un appel destructeur dans le compte Cloudflare de l'utilisateur ;
+le site reste joignable sur `<project>.pages.dev` et doit être retiré à la main.
 
 Les jobs sont sérialisés **par domaine** via une queue de promesses (`projectQueues`).
 
@@ -112,6 +130,7 @@ Les ports sont alloués dynamiquement à partir de `SSR_PORT_BASE + 1` (défaut:
 | `DOCKER_PORT_BASE` | Base des ports containers Docker (défaut: 6000 → premiers sites sur 6001, 6002…) |
 | `CLOUDFLARE_API_TOKEN` | Token Wrangler pour deploy CF Pages (mode `cloudflare`) |
 | `CLOUDFLARE_ACCOUNT_ID` | ID compte Cloudflare (mode `cloudflare`) |
+| `CLOUDFLARE_PRODUCTION_BRANCH` | Branche de production des projets Pages créés (défaut: `main`) |
 
 ## Points d'attention
 

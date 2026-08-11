@@ -40,6 +40,10 @@ const SERVICE_TOKEN = process.env.TRPC_SERVER_API_TOKEN ?? "";
 const PUBLISHER_HOST = process.env.PUBLISHER_HOST ?? "";
 const CF_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN ?? "";
 const CF_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID ?? "";
+// Production branch of every Pages project the publisher creates. Only the
+// name matters — there is no git repository behind it — but creating and
+// deploying have to agree, or the deployment is filed as a preview.
+const CF_PRODUCTION_BRANCH = process.env.CLOUDFLARE_PRODUCTION_BRANCH ?? "main";
 // URL interne Docker pour joindre le builder sans passer par Traefik/TLS
 const BUILDER_INTERNAL_URL = process.env.BUILDER_INTERNAL_URL ?? "http://app:3000";
 const PUBLISH_DIR = "/var/publish";
@@ -503,9 +507,10 @@ const toCfProjectName = (domain) =>
  * Workflow:
  *   1. webstudio sync
  *   2. webstudio build --template cloudflare
- *   3. npm install (first time)
+ *   3. npm install (first time, or when switching from another template)
  *   4. npm run build  (remix vite:build → build/client/)
- *   5. wrangler pages deploy ./build/client --project-name <cfProjectName>
+ *   5. wrangler pages project create <cfProjectName>   (first time)
+ *   6. wrangler pages deploy ./build/client --project-name <cfProjectName>
  */
 let wranglerInstalled = false;
 const ensureWrangler = async () => {
@@ -520,12 +525,56 @@ const ensureWrangler = async () => {
   }
 };
 
+/**
+ * Create the Pages project unless it already exists.
+ *
+ * wrangler 3 created the project implicitly on the first `pages deploy`.
+ * wrangler 4 removed that and hard-fails with `The Pages project "<name>"
+ * does not exist`, so a first publish could never succeed. The cloudflare
+ * template pins wrangler ^3.63.2, but ensureWrangler above installs the
+ * latest globally and the global one is what runs here — so in practice this
+ * always hits the wrangler 4 behaviour.
+ *
+ * Creating up front is correct on both majors. A create against an existing
+ * project exits non-zero, which is the normal path on every publish after the
+ * first, so failures are logged and swallowed: if the create failed for a real
+ * reason (bad token, wrong account) the deploy that follows fails with a
+ * clearer message than anything we could produce here.
+ */
+const ensureCfPagesProject = async (cfProjectName, run) => {
+  try {
+    await run(
+      `wrangler pages project create ${cfProjectName} --production-branch ${CF_PRODUCTION_BRANCH}`,
+      {
+        CLOUDFLARE_API_TOKEN: CF_API_TOKEN,
+        CLOUDFLARE_ACCOUNT_ID: CF_ACCOUNT_ID,
+      }
+    );
+    log(`Created Cloudflare Pages project "${cfProjectName}"`);
+  } catch (err) {
+    log(
+      `Cloudflare Pages project "${cfProjectName}" was not created (it most likely already exists): ${err.message.split("\n")[0]}`
+    );
+  }
+};
+
 const publishBuildCloudflare = async ({ buildId }) => {
   log(`Starting Cloudflare publish for build ${buildId}`);
   await ensureWrangler();
 
-  const { projectDomain: domain } = await getProjectBuildInfo(buildId);
+  const { projectDomain: domain, customDomains } = await getProjectBuildInfo(buildId);
   log(`Project domain: ${domain}`);
+  if (customDomains.length > 0) {
+    log(`Custom domains: ${customDomains.join(", ")}`);
+  }
+
+  // Matches publishBuild: bare slugs are qualified with PUBLISHER_HOST, custom
+  // domains are already fully qualified. Only used to find what a previous
+  // publish left behind locally.
+  const publishDomain =
+    !domain.includes(".") && PUBLISHER_HOST
+      ? `${domain}.${PUBLISHER_HOST}`
+      : domain;
 
   const workDir = join(WORK_DIR, domain);
   await mkdir(workDir, { recursive: true });
@@ -541,6 +590,27 @@ const publishBuildCloudflare = async ({ buildId }) => {
     if (stderr) log(`  stderr: ${stderr.trim()}`);
   };
 
+  // Handle mode transitions → cloudflare. Without this a site that was
+  // previously served locally stays served locally, in parallel with the Pages
+  // deployment and diverging from it on every later publish.
+  const stateFile = join(workDir, "state.json");
+  try {
+    const prevState = JSON.parse(await readFile(stateFile, "utf8"));
+    if (prevState.mode === "ssr") {
+      stopSsrForDomain(domain, prevState.publishDomain, prevState.customDomains ?? []);
+      log(`Stopped SSR process for ${domain} (switching to Cloudflare)`);
+    } else if (prevState.mode === "docker") {
+      await stopDockerForDomain(domain, prevState.containerName, prevState.publishDomain, prevState.customDomains ?? []);
+      log(`Stopped Docker container for ${domain} (switching to Cloudflare)`);
+    }
+  } catch { /* no state.json — new domain, or previously SSG */ }
+
+  // SSG leaves no state.json, so clear static output unconditionally rather
+  // than on a detected transition.
+  for (const hostname of [publishDomain, ...customDomains]) {
+    await rm(join(PUBLISH_DIR, hostname), { recursive: true, force: true });
+  }
+
   // 1. Sync build data
   log(`Syncing build data for ${domain}...`);
   await run(
@@ -551,9 +621,28 @@ const publishBuildCloudflare = async ({ buildId }) => {
   log(`Generating Cloudflare code for ${domain}...`);
   await run(`webstudio build --template cloudflare`);
 
-  // 3. Install npm dependencies (first publish only)
+  // 3. Install npm dependencies (first publish, or after a template switch).
+  //
+  // Testing only for the directory is not enough: an earlier ssg or docker
+  // publish in the same workDir leaves a node_modules for a different
+  // template, and the build then fails on missing remix binaries. Same marker
+  // approach publishBuild uses for vike — @remix-run/cloudflare-pages is
+  // unique to this template, so its absence means the tree belongs to another.
   const nodeModulesPath = join(workDir, "node_modules");
-  if (!(await pathExists(nodeModulesPath))) {
+  let needsInstall = !(await pathExists(nodeModulesPath));
+  if (!needsInstall) {
+    try {
+      await readFile(
+        join(nodeModulesPath, "@remix-run/cloudflare-pages", "package.json"),
+        "utf8"
+      );
+    } catch {
+      log(`  node_modules belongs to another template — reinstalling`);
+      await rm(nodeModulesPath, { recursive: true, force: true });
+      needsInstall = true;
+    }
+  }
+  if (needsInstall) {
     log(`Installing dependencies for ${domain}...`);
     await run(`npm install`);
   }
@@ -564,13 +653,26 @@ const publishBuildCloudflare = async ({ buildId }) => {
 
   // 5. Deploy to Cloudflare Pages
   const cfProjectName = toCfProjectName(domain);
+  await ensureCfPagesProject(cfProjectName, run);
   log(`Deploying ${domain} to Cloudflare Pages project "${cfProjectName}"...`);
+  // --branch is explicit because workDir is not a git repository: left to
+  // infer, wrangler cannot tell this is the production branch and the build
+  // lands on a preview URL instead of <project>.pages.dev.
   await run(
-    `wrangler pages deploy ./build/client --project-name ${cfProjectName}`,
+    `wrangler pages deploy ./build/client --project-name ${cfProjectName} --branch ${CF_PRODUCTION_BRANCH}`,
     {
       CLOUDFLARE_API_TOKEN: CF_API_TOKEN,
       CLOUDFLARE_ACCOUNT_ID: CF_ACCOUNT_ID,
     }
+  );
+
+  // 6. Persist state. Nothing restores anything for this mode — Pages runs the
+  // site — but unpublish and delete look the site up by hostname here, and
+  // without a record they cannot see a Cloudflare site at all.
+  await writeFile(
+    stateFile,
+    JSON.stringify({ mode: "cloudflare", cfProjectName, publishDomain, customDomains }, null, 2) + "\n",
+    "utf8"
   );
 
   log(`Successfully deployed ${domain} to Cloudflare Pages`);
@@ -608,6 +710,12 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
       await rm(stateFile, { force: true });
     } else if (prevState.mode === "docker") {
       await stopDockerForDomain(domain, prevState.containerName, prevState.publishDomain, prevState.customDomains ?? []);
+      await rm(stateFile, { force: true });
+    } else if (prevState.mode === "cloudflare") {
+      // Deleting the Pages project is a destructive call into the user's
+      // Cloudflare account, so it is left alone deliberately. Say so, because
+      // the site stays reachable at <project>.pages.dev after this publish.
+      log(`${domain} was on Cloudflare Pages — project "${prevState.cfProjectName}" left in place and still live`);
       await rm(stateFile, { force: true });
     }
   } catch {
@@ -834,6 +942,9 @@ const publishBuildSsr = async ({ buildId }) => {
     } else if (prevState.mode === "ssr") {
       stopSsrForDomain(domain, prevState.publishDomain, prevState.customDomains ?? []);
       log(`Stopped SSR process for ${domain} (switching to Docker)`);
+    } else if (prevState.mode === "cloudflare") {
+      // Same as the SSG path: the Pages project is the user's to delete.
+      log(`${domain} was on Cloudflare Pages — project "${prevState.cfProjectName}" left in place and still live`);
     }
     // mode: "docker" → old container is stopped in step 6 below
   } catch { /* no state.json — new domain */ }
