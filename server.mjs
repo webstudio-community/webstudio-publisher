@@ -1012,6 +1012,111 @@ const proxyServer = createServer(async (req, res) => {
   }
 });
 
+// ─── Unpublish ────────────────────────────────────────────────────────────────
+
+const removeTraefikRouteForDomain = async (domain) => {
+  if (!TRAEFIK_DYNAMIC_DIR || !domain.includes(".")) return;
+  await rm(join(TRAEFIK_DYNAMIC_DIR, `${domain}.yaml`), { force: true });
+};
+
+/**
+ * Drop a single hostname from a site that still has other hostnames.
+ * state.json is rewritten to list exactly the hostnames that remain live, so a
+ * later restoreSsrProcesses() does not re-register the removed one.
+ */
+const removeHostname = async (stateFile, state, hostname, remaining) => {
+  log(`Removing hostname ${hostname} (site keeps ${remaining.join(", ")})`);
+  dockerHostContainer.delete(hostname);
+  ssrHostPort.delete(hostname);
+  await rm(join(PUBLISH_DIR, hostname), { recursive: true, force: true });
+  await removeTraefikRouteForDomain(hostname);
+  const [publishDomain, ...customDomains] = remaining;
+  await writeFile(
+    stateFile,
+    JSON.stringify({ ...state, publishDomain, customDomains }, null, 2) + "\n",
+    "utf8"
+  );
+};
+
+/**
+ * Tear a site down completely: its runtime, every published copy, and the work
+ * directory. Each docker step is best-effort so a missing container or volume
+ * cannot stop the rest — what matters is that the site stops being served.
+ */
+const teardownSite = async (domain, state) => {
+  const { mode, containerName, imageName, publishDomain, customDomains = [] } = state;
+  const hostnames = [publishDomain, ...customDomains].filter(Boolean);
+  log(`Tearing down ${domain} (mode ${mode ?? "ssg"})`);
+
+  if (mode === "docker") {
+    await stopDockerForDomain(domain, containerName, publishDomain, customDomains);
+    if (imageName) {
+      try { await execAsync(`docker rmi ${imageName}`); } catch {}
+      try { await execAsync(`docker volume rm ${imageName}-ipx-cache`); } catch {}
+    }
+  } else if (mode === "ssr") {
+    stopSsrForDomain(domain, publishDomain, customDomains);
+  } else if (mode === "cloudflare") {
+    // Deleting someone's Cloudflare Pages project is a destructive call into
+    // their account with different semantics from the local modes, so it is
+    // deliberately left out here.
+    log(`Cloudflare Pages project for ${domain} was NOT deleted — remove it from the Cloudflare dashboard`);
+  }
+
+  for (const hostname of hostnames) {
+    dockerHostContainer.delete(hostname);
+    ssrHostPort.delete(hostname);
+    await rm(join(PUBLISH_DIR, hostname), { recursive: true, force: true });
+    await removeTraefikRouteForDomain(hostname);
+  }
+
+  // Last: while state.json exists, restoreSsrProcesses() restarts the site on
+  // the next publisher boot, so removing it is what makes the teardown stick.
+  await rm(join(WORK_DIR, domain), { recursive: true, force: true });
+  log(`Tore down ${domain}`);
+};
+
+/**
+ * Unpublish one hostname. Idempotent: unknown hostnames succeed as a no-op so
+ * a retried or duplicated request cannot fail a project deletion.
+ */
+const unpublishHostname = async (hostname) => {
+  let entries = [];
+  try {
+    entries = await readdir(WORK_DIR, { withFileTypes: true });
+  } catch { /* nothing published yet */ }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const domain = entry.name;
+    const stateFile = join(WORK_DIR, domain, "state.json");
+    let state;
+    try {
+      state = JSON.parse(await readFile(stateFile, "utf8"));
+    } catch {
+      continue;
+    }
+    const hostnames = [state.publishDomain, ...(state.customDomains ?? [])].filter(Boolean);
+    if (hostnames.includes(hostname) === false) {
+      continue;
+    }
+    const remaining = hostnames.filter((item) => item !== hostname);
+    if (remaining.length > 0) {
+      await removeHostname(stateFile, state, hostname, remaining);
+      return { removed: true, teardown: false };
+    }
+    await teardownSite(domain, state);
+    return { removed: true, teardown: true };
+  }
+
+  // No state.json claims this hostname. It can still have a published copy on
+  // disk from an SSG publish whose work directory was removed, so clean that up.
+  await rm(join(PUBLISH_DIR, hostname), { recursive: true, force: true });
+  await removeTraefikRouteForDomain(hostname);
+  log(`No site state found for ${hostname}, removed any leftover published files`);
+  return { removed: false, teardown: false };
+};
+
 // ─── Build API server ─────────────────────────────────────────────────────────
 
 const server = createServer(async (req, res) => {
@@ -1068,6 +1173,37 @@ const server = createServer(async (req, res) => {
             logErr(`Failed to notify FAILED status for ${buildId}: ${notifyErr.message}`)
           );
         });
+    });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/unpublish") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", async () => {
+      let input;
+      try {
+        input = JSON.parse(body);
+      } catch {
+        res.writeHead(400);
+        res.end("Invalid JSON");
+        return;
+      }
+      const { domain } = input;
+      if (!domain) {
+        res.writeHead(400);
+        res.end("Missing domain");
+        return;
+      }
+      try {
+        const result = await unpublishHostname(domain);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true, ...result }));
+      } catch (error) {
+        logErr(`Unpublish failed for ${domain}: ${error.message}`);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: error.message }));
+      }
     });
     return;
   }
