@@ -47,8 +47,10 @@ POST /publish { buildId, builderOrigin, buildMode: "ssg" }
   → webstudio build --template ssg
   → patch des +data.ts (fix prerender origin)
   → npm install (si node_modules absent ou vike version changée)
-  → WEBSTUDIO_PRERENDER_ORIGIN=... npx vite build
-  → cp dist/client → /var/publish/<domain>/
+  → WEBSTUDIO_PRERENDER_ORIGIN=... WEBSTUDIO_SITEMAP_ORIGIN=... npx vite build
+  → réécriture des URLs absolues (.html et .xml) vers l'origine publique
+  → cp dist/client → /var/publish/<domain>/ (+ une copie par custom domain,
+    réécrite vers l'origine de ce domaine)
 ```
 
 ### `ssr` — Node SSR local
