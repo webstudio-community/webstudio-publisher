@@ -698,7 +698,12 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
 
   // 4. Build static HTML with Vite + vike prerender
   log(`Building static site for ${domain}...`);
-  await run(`WEBSTUDIO_PRERENDER_ORIGIN=${BUILDER_INTERNAL_URL} npm run build`);
+  // WEBSTUDIO_SITEMAP_ORIGIN makes the CLI emit sitemap.xml with absolute URLs.
+  // The internal origin is used here and rewritten to the public one in 4b, and
+  // again per custom domain in 5b, so every copy gets a spec-correct sitemap.
+  await run(
+    `WEBSTUDIO_PRERENDER_ORIGIN=${BUILDER_INTERNAL_URL} WEBSTUDIO_SITEMAP_ORIGIN=${BUILDER_INTERNAL_URL} npm run build`
+  );
 
   // Check output
   const distDir = join(workDir, "dist", "client");
@@ -718,29 +723,33 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
     throw new Error(`Prerender produced no HTML files. Check vite build output for errors.`);
   }
 
-  // 4b. Fix meta URLs in generated HTML:
+  // 4b. Fix absolute URLs in generated output:
   //   - og:url leaks the Docker-internal origin (e.g. http://app:3000) → replace with public HTTPS domain
   //   - og:image / twitter:image are relative paths → make absolute for social scrapers
+  //   - sitemap.xml <loc> entries carry the same internal origin
+  // .xml is included because the sitemaps protocol requires absolute URLs that
+  // sit under the host serving the sitemap, so each domain's copy below has to
+  // be rewritten just like the HTML.
   const publicOrigin = `https://${publishDomain}`;
-  const transformHtmlFiles = async (dir, transform) => {
+  const transformOutputFiles = async (dir, transform) => {
     let entries;
     try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
     for (const entry of entries) {
       const fullPath = join(dir, entry.name);
       if (entry.isDirectory()) {
-        await transformHtmlFiles(fullPath, transform);
-      } else if (entry.name.endsWith(".html")) {
+        await transformOutputFiles(fullPath, transform);
+      } else if (entry.name.endsWith(".html") || entry.name.endsWith(".xml")) {
         const content = await readFile(fullPath, "utf8");
         const fixed = transform(content);
         if (fixed !== content) {
           await writeFile(fullPath, fixed, "utf8");
-          log(`  Updated meta URLs in ${fullPath}`);
+          log(`  Updated URLs in ${fullPath}`);
         }
       }
     }
   };
-  log(`Fixing meta URLs in generated HTML...`);
-  await transformHtmlFiles(distDir, (html) => {
+  log(`Fixing absolute URLs in generated output...`);
+  await transformOutputFiles(distDir, (html) => {
     let out = html.replaceAll(BUILDER_INTERNAL_URL, publicOrigin);
     out = out.replace(/(property="og:image"\s+content=")(\/[^"]*)/g, (_, prefix, path) => `${prefix}${publicOrigin}${path}`);
     out = out.replace(/(name="twitter:image"\s+content=")(\/[^"]*)/g, (_, prefix, path) => `${prefix}${publicOrigin}${path}`);
@@ -759,8 +768,8 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
     log(`Publishing custom domain ${customDomain} to ${customDestDir}...`);
     await rm(customDestDir, { recursive: true, force: true });
     await cp(distDir, customDestDir, { recursive: true });
-    log(`  Rewriting og:url to https://${customDomain}...`);
-    await transformHtmlFiles(customDestDir, (html) => html.replaceAll(publicOrigin, `https://${customDomain}`));
+    log(`  Rewriting absolute URLs to https://${customDomain}...`);
+    await transformOutputFiles(customDestDir, (html) => html.replaceAll(publicOrigin, `https://${customDomain}`));
     await writeTraefikRouteForDomain(customDomain);
   }
 
