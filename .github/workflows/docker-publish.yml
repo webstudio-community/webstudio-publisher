@@ -25,7 +25,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ARM64 support via QEMU (enables Raspberry Pi builds)
+      # ARM64 support via QEMU (enables Raspberry Pi builds).
+      # Note: only the small runtime stage is emulated — the heavy `cli-build`
+      # stage is pinned to $BUILDPLATFORM and runs natively for both targets.
       - uses: docker/setup-qemu-action@v3
 
       - uses: docker/setup-buildx-action@v3
@@ -56,6 +58,31 @@ jobs:
           fi
           echo "tag=$SAFE" >> "$GITHUB_OUTPUT"
 
+      # Resolve the source repo + commit the deployed builder image was built from,
+      # so the CLI baked into the publisher image is built from the SAME fork at the
+      # SAME commit (CLI ↔ builder lockstep — prevents the apiCompatibility mismatch).
+      # Reads the OCI labels of ghcr.io/<owner>/builder:latest; falls back to the
+      # webstudio-community fork's `develop` tip if the labels can't be read.
+      - name: Resolve builder source + commit (CLI lockstep)
+        id: builder
+        run: |
+          set -uo pipefail
+          CFG=$(docker run --rm gcr.io/go-containerregistry/crane:latest \
+            config "ghcr.io/${{ github.repository_owner }}/builder:latest" 2>/dev/null || true)
+          REV=$(jq -r '.config.Labels["org.opencontainers.image.revision"] // empty' <<<"$CFG" 2>/dev/null || true)
+          SRC=$(jq -r '.config.Labels["org.opencontainers.image.source"] // empty' <<<"$CFG" 2>/dev/null || true)
+          if [ -z "$REV" ]; then
+            echo "::warning::Could not read builder revision label; falling back to 'develop'"
+            REV=develop
+          fi
+          if [ -z "$SRC" ]; then
+            SRC=https://github.com/webstudio-community/webstudio-fork
+          fi
+          REPO="${SRC%.git}.git"
+          echo "Building CLI from ${REPO}@${REV}"
+          echo "ref=$REV" >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+
       # Derive image tags:
       #   push to main                           → :latest
       #   workflow_dispatch on main              → :latest
@@ -80,6 +107,9 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            WEBSTUDIO_REF=${{ steps.builder.outputs.ref }}
+            WEBSTUDIO_REPO=${{ steps.builder.outputs.repo }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
