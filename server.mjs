@@ -52,6 +52,9 @@ const TRAEFIK_DYNAMIC_DIR = process.env.TRAEFIK_DYNAMIC_DIR ?? "";
 // Auto-detected at startup from the publisher container's own networks.
 // Override with DOCKER_NETWORK env var if auto-detection picks the wrong one.
 let DOCKER_NETWORK = process.env.DOCKER_NETWORK ?? "";
+// Own container name — resolved at startup via docker inspect.
+// Used in Traefik configs instead of IP (stable across container restarts).
+let OWN_CONTAINER_NAME = "";
 
 const log = (msg) => console.info(`[publisher] ${msg}`);
 const logErr = (msg) => console.error(`[publisher] ${msg}`);
@@ -335,10 +338,14 @@ const notifyBuildStatus = async (buildId, publishStatus) => {
 
 /**
  * Get this container's own proxy URL for use in Traefik file-provider service definitions.
- * Cross-provider references (ws-publisher-svc@docker) don't work reliably in Traefik v3
- * file-provider configs, so we define the service inline with a direct IP+port URL.
+ * Uses the Docker container name (resolved at startup) so the URL stays valid across
+ * container restarts — container names are stable, IPs are not.
+ * Falls back to IP detection if the container name could not be resolved.
  */
 const getOwnProxyUrl = () => {
+  if (OWN_CONTAINER_NAME) {
+    return `http://${OWN_CONTAINER_NAME}:${PROXY_PORT}`;
+  }
   const ifaces = networkInterfaces();
   for (const list of Object.values(ifaces)) {
     for (const iface of list) {
@@ -1242,11 +1249,12 @@ try {
   logErr("Warning: Docker socket not accessible — buildMode 'ssr' will not work. Mount /var/run/docker.sock into this container.");
 }
 
+const ownHostname = process.env.HOSTNAME ?? "";
+
 if (!DOCKER_NETWORK) {
   try {
-    const hostname = process.env.HOSTNAME ?? "";
     const { stdout } = await execAsync(
-      `docker inspect --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' ${hostname}`
+      `docker inspect --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' ${ownHostname}`
     );
     const networks = stdout.trim().replace(/'/g, "").split(/\s+/)
       .filter((n) => n && n !== "bridge" && n !== "host" && n !== "none");
@@ -1259,6 +1267,16 @@ if (!DOCKER_NETWORK) {
   } catch {
     logErr("Warning: DOCKER_NETWORK auto-detection failed — set DOCKER_NETWORK env var manually.");
   }
+}
+
+try {
+  const { stdout } = await execAsync(
+    `docker inspect --format '{{.Name}}' ${ownHostname}`
+  );
+  OWN_CONTAINER_NAME = stdout.trim().replace(/^\//, "");
+  log(`Own container name: ${OWN_CONTAINER_NAME}`);
+} catch {
+  logErr("Warning: could not resolve own container name — Traefik configs will use IP (may break on container restart).");
 }
 
 await restoreSsrProcesses();
