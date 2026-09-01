@@ -152,6 +152,11 @@ pinnée n'est **jamais** taguée `:latest`, même dispatchée depuis `main` : c'
 rôle de la sortie `pinned` du step « Compute branch tag », car `github.ref` vaut
 `refs/heads/main` sur un dispatch depuis `main` et suffirait sinon à écraser `:latest`.
 
+`builder_ref` est résolu en **SHA** via `git ls-remote` avant le build : le stage
+`cli-build` cache `git checkout "$WEBSTUDIO_REF"` sur une couche keyée par la valeur
+littérale de l'ARG, donc re-dispatcher la **même branche** après un nouveau commit
+réutiliserait un checkout périmé si on passait le nom de branche tel quel.
+
 ```bash
 gh workflow run docker-publish.yml --repo webstudio-community/webstudio-publisher \
   -f builder_ref=<branche-du-fork>

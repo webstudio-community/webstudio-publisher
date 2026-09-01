@@ -107,10 +107,17 @@ jobs:
           BUILDER_REF: ${{ inputs.builder_ref }}
         run: |
           set -uo pipefail
+          REPO="https://github.com/${{ github.repository_owner }}/webstudio-fork.git"
           if [ -n "$BUILDER_REF" ]; then
-            echo "Pinned builder ref requested: $BUILDER_REF"
-            echo "ref=$BUILDER_REF" >> "$GITHUB_OUTPUT"
-            echo "repo=https://github.com/${{ github.repository_owner }}/webstudio-fork.git" >> "$GITHUB_OUTPUT"
+            # Resolve to an immutable commit SHA. The Dockerfile's cli-build stage
+            # runs `git checkout "$WEBSTUDIO_REF"` in a cached layer keyed on the
+            # literal ARG value — a branch name never changes, so re-dispatching
+            # the same branch would reuse a stale checkout. A SHA cache-busts it.
+            SHA=$(git ls-remote "$REPO" "$BUILDER_REF" | awk 'NR==1{print $1}')
+            [ -z "$SHA" ] && SHA="$BUILDER_REF"  # already a SHA, or a tag ls-remote missed
+            echo "Pinned builder ref $BUILDER_REF -> $SHA"
+            echo "ref=$SHA" >> "$GITHUB_OUTPUT"
+            echo "repo=$REPO" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           CFG=$(docker run --rm gcr.io/go-containerregistry/crane:latest \
