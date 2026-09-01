@@ -145,6 +145,22 @@ passé via `--build-arg WEBSTUDIO_REF`. Le CI (`docker-publish.yml`) lit le labe
 et l'utilise comme ref → le CLI du publisher est toujours au **même commit que le
 builder déployé**. Ne jamais revenir à `npm install -g webstudio@latest`.
 
+**Tester une branche builder non mergée** : `docker-publish.yml` accepte deux inputs
+de `workflow_dispatch` — `builder_ref` (branche/tag/commit du fork, court-circuite la
+lecture du label) et `image_tag` (optionnel, défaut `builder-<ref>`). Une image ainsi
+pinnée n'est **jamais** taguée `:latest`, même dispatchée depuis `main` : c'est le
+rôle de la sortie `pinned` du step « Compute branch tag », car `github.ref` vaut
+`refs/heads/main` sur un dispatch depuis `main` et suffirait sinon à écraser `:latest`.
+
+```bash
+gh workflow run docker-publish.yml --repo webstudio-community/webstudio-publisher \
+  -f builder_ref=<branche-du-fork>
+```
+
+C'est indispensable dès qu'un sync upstream déplace le `bundleVersion` : le builder
+rebasé et le CLI du publisher doivent être buildés depuis le **même** commit, sinon
+`assertCliBundleVersion` rejette le publish (`Project bundle format is incompatible`).
+
 ### Version des packages `@webstudio-is/*` stampée (`WEBSTUDIO_SDK_VERSION`)
 
 Buildé depuis les sources, le CLI garde le placeholder `0.0.0-webstudio-version`.

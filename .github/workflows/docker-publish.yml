@@ -9,6 +9,21 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      builder_ref:
+        description: >-
+          Builder ref (branch, tag or commit) to build the bundled CLI from.
+          Leave empty for the normal lockstep behaviour (the commit
+          builder:latest was built from). Setting it produces a TEST image:
+          it is never published as :latest.
+        required: false
+        type: string
+      image_tag:
+        description: >-
+          Tag for the test image. Only used together with builder_ref;
+          defaults to builder-<sanitized builder_ref>.
+        required: false
+        type: string
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -40,22 +55,43 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Sanitize branch name for use as image tag (pull_request and workflow_dispatch)
+      # Sanitize branch name for use as image tag (pull_request and workflow_dispatch).
+      # A dispatch that pins `builder_ref` builds a CLI from an unmerged builder
+      # branch, so the result is a TEST image: it is tagged from that ref (or from
+      # `image_tag`) and `pinned=true` keeps it off :latest below. This is what
+      # makes a builder PR testable end-to-end before merge.
       - name: Compute branch tag
         id: branch
+        env:
+          BUILDER_REF: ${{ inputs.builder_ref }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
+          sanitize() {
+            echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/-\+/-/g' | sed 's/^-//;s/-$//'
+          }
+
           # For PR events GITHUB_REF_NAME is "N/merge" — use head_ref instead
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             BRANCH="${{ github.head_ref }}"
           else
             BRANCH="${GITHUB_REF_NAME}"
           fi
-          SAFE=$(echo "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/-\+/-/g' | sed 's/^-//;s/-$//')
-          if [[ "$BRANCH" == "main" ]]; then
-            echo "is_main=true" >> "$GITHUB_OUTPUT"
-          else
+
+          if [ -n "$BUILDER_REF" ]; then
+            SAFE=$(sanitize "${IMAGE_TAG:-builder-$BUILDER_REF}")
+            # Never :latest — this image carries an unmerged builder's CLI.
+            echo "pinned=true" >> "$GITHUB_OUTPUT"
             echo "is_main=false" >> "$GITHUB_OUTPUT"
+          else
+            SAFE=$(sanitize "$BRANCH")
+            echo "pinned=false" >> "$GITHUB_OUTPUT"
+            if [[ "$BRANCH" == "main" ]]; then
+              echo "is_main=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "is_main=false" >> "$GITHUB_OUTPUT"
+            fi
           fi
+          echo "Image tag: $SAFE"
           echo "tag=$SAFE" >> "$GITHUB_OUTPUT"
 
       # Resolve the source repo + commit the deployed builder image was built from,
@@ -63,10 +99,20 @@ jobs:
       # SAME commit (CLI ↔ builder lockstep — prevents the apiCompatibility mismatch).
       # Reads the OCI labels of ghcr.io/<owner>/builder:latest; falls back to the
       # webstudio-community fork's `develop` tip if the labels can't be read.
+      # A pinned `builder_ref` short-circuits the lookup: the point is to build the
+      # CLI from a builder commit that has NOT shipped as builder:latest yet.
       - name: Resolve builder source + commit (CLI lockstep)
         id: builder
+        env:
+          BUILDER_REF: ${{ inputs.builder_ref }}
         run: |
           set -uo pipefail
+          if [ -n "$BUILDER_REF" ]; then
+            echo "Pinned builder ref requested: $BUILDER_REF"
+            echo "ref=$BUILDER_REF" >> "$GITHUB_OUTPUT"
+            echo "repo=https://github.com/${{ github.repository_owner }}/webstudio-fork.git" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           CFG=$(docker run --rm gcr.io/go-containerregistry/crane:latest \
             config "ghcr.io/${{ github.repository_owner }}/builder:latest" 2>/dev/null || true)
           REV=$(jq -r '.config.Labels["org.opencontainers.image.revision"] // empty' <<<"$CFG" 2>/dev/null || true)
@@ -87,8 +133,13 @@ jobs:
       #   push to main                           → :latest
       #   workflow_dispatch on main              → :latest
       #   workflow_dispatch on other branch      → :<sanitized-branch>
+      #   workflow_dispatch with builder_ref     → :builder-<ref> (or :<image_tag>), never :latest
       #   pull_request                           → :<sanitized-branch>
       #   published release                      → :<version> + :latest
+      #
+      # The `pinned` guard on :latest is load-bearing: a dispatch is normally run
+      # from `main`, so `github.ref` alone would still match and overwrite :latest
+      # with a test image built from an unmerged builder commit.
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -96,7 +147,7 @@ jobs:
           images: |
             ghcr.io/${{ github.repository_owner }}/webstudio-publisher
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && steps.branch.outputs.is_main == 'true') }}
+            type=raw,value=latest,enable=${{ steps.branch.outputs.pinned == 'false' && (github.ref == 'refs/heads/main' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && steps.branch.outputs.is_main == 'true')) }}
             type=raw,value=${{ steps.branch.outputs.tag }},enable=${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && steps.branch.outputs.is_main == 'false' }}
             type=semver,pattern={{version}},enable=${{ github.event_name == 'release' }}
             type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'release' }}
