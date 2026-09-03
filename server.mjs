@@ -5,22 +5,22 @@
  * (SSG) or runs a Node SSR server (SSR) depending on buildMode.
  *
  * Build modes (POST /publish { buildId, builderOrigin, buildMode }):
- *   ssg        — Vite prerender → static files in /var/publish/<domain>/
- *   cloudflare — React Router build + wrangler pages deploy
- *   ssr        — React Router build → docker build + docker run, one container per domain
+ * ssg        — Vite prerender → static files in /var/publish/<domain>/
+ * cloudflare — React Router build + wrangler pages deploy
+ * ssr        — React Router build → docker build + docker run, one container per domain
  *
  * SSR proxy (port PROXY_PORT, default 4001):
- *   Serves all published sites — SSR domains are proxied to their Docker container,
- *   SSG domains are served directly from /var/publish/<domain>/.
- *   The self-host stack should route *.PUBLISHER_HOST traffic to this port.
+ * Serves all published sites — SSR domains are proxied to their Docker container,
+ * SSG domains are served directly from /var/publish/<domain>/.
+ * The self-host stack should route *.PUBLISHER_HOST traffic to this port.
  *
  * Environment variables:
- *   TRPC_SERVER_API_TOKEN  — service token to authenticate with the builder app
- *   BUILDER_INTERNAL_URL   — internal Docker URL for the builder (default: http://app:3000)
- *   PORT                   — build API HTTP port (default: 4000)
- *   PROXY_PORT             — site proxy HTTP port (default: 4001)
- *   SSR_PORT_BASE          — base port for legacy SSR subprocesses (default: 5000)
- *   DOCKER_NETWORK         — Docker network shared with site containers (required for SSR mode)
+ * TRPC_SERVER_API_TOKEN  — service token to authenticate with the builder app
+ * BUILDER_INTERNAL_URL   — internal Docker URL for the builder (default: http://app:3000)
+ * PORT                   — build API HTTP port (default: 4000)
+ * PROXY_PORT             — site proxy HTTP port (default: 4001)
+ * SSR_PORT_BASE          — base port for legacy SSR subprocesses (default: 5000)
+ * DOCKER_NETWORK         — Docker network shared with site containers (required for SSR mode)
  */
 
 import { createServer, request as httpRequest } from "node:http";
@@ -508,11 +508,11 @@ const toCfProjectName = (domain) =>
  * Deploy to Cloudflare Pages for the given build.
  *
  * Workflow:
- *   1. webstudio sync
- *   2. webstudio build --template cloudflare
- *   3. npm install (first time)
- *   4. npm run build  (remix vite:build → build/client/)
- *   5. wrangler pages deploy ./build/client --project-name <cfProjectName>
+ * 1. webstudio sync
+ * 2. webstudio build --template cloudflare
+ * 3. npm install (first time)
+ * 4. npm run build  (remix vite:build → build/client/)
+ * 5. wrangler pages deploy ./build/client --project-name <cfProjectName>
  */
 let wranglerInstalled = false;
 const ensureWrangler = async () => {
@@ -559,8 +559,8 @@ const publishBuildCloudflare = async ({ buildId }) => {
   await run(`webstudio build --template cloudflare`);
 
   // 3. Install npm dependencies (first publish only)
-  const nodeModulesPath = join(workDir, "node_modules");
-  if (!(await pathExists(nodeModulesPath))) {
+  const remixBinPath = join(workDir, "node_modules", ".bin", "remix");
+  if (!(await pathExists(remixBinPath))) {
     log(`Installing dependencies for ${domain}...`);
     await run(`npm install`);
   }
@@ -571,6 +571,15 @@ const publishBuildCloudflare = async ({ buildId }) => {
 
   // 5. Deploy to Cloudflare Pages
   const cfProjectName = toCfProjectName(domain);
+  try {
+    await run(`wrangler pages project create ${cfProjectName} --production-branch main`, {
+      CLOUDFLARE_API_TOKEN: CF_API_TOKEN,
+      CLOUDFLARE_ACCOUNT_ID: CF_ACCOUNT_ID,
+    });
+  } catch (e) {
+    /* ignore if project already exists */
+  }
+
   log(`Deploying ${domain} to Cloudflare Pages project "${cfProjectName}"...`);
   await run(
     `wrangler pages deploy ./build/client --project-name ${cfProjectName}`,
@@ -801,13 +810,13 @@ const toDockerName = (domain) =>
  * Publish an SSR site as an isolated Docker container.
  *
  * Workflow:
- *   1. webstudio sync
- *   2. webstudio build --template docker
- *   3. Write DOCKER_SITE_DOCKERFILE into workDir
- *   4. docker build -t <image> .   ← built ONCE, reused for all hostnames
- *   5. docker stop/rm old container + docker run new one
- *   6. docker image prune -f
- *   7. Persist state.json + register all hostnames in ssrHostPort (proxy reuse)
+ * 1. webstudio sync
+ * 2. webstudio build --template docker
+ * 3. Write DOCKER_SITE_DOCKERFILE into workDir
+ * 4. docker build -t <image> .   ← built ONCE, reused for all hostnames
+ * 5. docker stop/rm old container + docker run new one
+ * 6. docker image prune -f
+ * 7. Persist state.json + register all hostnames in ssrHostPort (proxy reuse)
  */
 const publishBuildSsr = async ({ buildId }) => {
   log(`Starting Docker publish for build ${buildId}`);
@@ -958,8 +967,8 @@ if (patched !== c) {
 
 /**
  * Unified HTTP proxy that serves all published Webstudio sites:
- *   - SSR domains  → reverse-proxied to their react-router-serve subprocess
- *   - SSG domains  → served directly from /var/publish/<host>/
+ * - SSR domains  → reverse-proxied to their react-router-serve subprocess
+ * - SSG domains  → served directly from /var/publish/<host>/
  *
  * The self-host stack should route *.PUBLISHER_HOST traffic here (PROXY_PORT).
  */
