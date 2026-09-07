@@ -72,14 +72,55 @@ La stack self-host doit router `*.PUBLISHER_HOST` vers ce port (voir `webstudio-
 
 ```
 POST /publish { buildId, builderOrigin, buildMode: "cloudflare" }
+  → arrêt du mode précédent (container docker / process ssr) + purge de /var/publish/<hostname>
   → webstudio sync --buildId --origin --authToken
   → webstudio build --template cloudflare
-  → npm install (si node_modules absent)
+  → npm install (si node_modules absent OU appartient à un autre template)
   → npm run build  (remix vite:build → build/client/)
-  → wrangler pages deploy ./build/client --project-name <domain-sanitisé>
+  → ./node_modules/.bin/wrangler pages project create <domain-sanitisé> --production-branch main   ← si absent
+  → ./node_modules/.bin/wrangler pages deploy ./build/client --project-name <domain-sanitisé> --branch main
+  → rattachement de chaque customDomain au projet Pages (API Cloudflare)
+  → state.json { mode: "cloudflare", cfProjectName, publishDomain, customDomains }
 ```
 
-Requiert `CLOUDFLARE_API_TOKEN` et `CLOUDFLARE_ACCOUNT_ID`. Le projet CF Pages est créé automatiquement par wrangler s'il n'existe pas.
+Requiert `CLOUDFLARE_API_TOKEN` et `CLOUDFLARE_ACCOUNT_ID`.
+
+**Le projet CF Pages n'est PAS créé automatiquement par le deploy.** wrangler 3 le
+faisait ; wrangler 4 a supprimé ce comportement et échoue avec `The Pages project
+"<name>" does not exist`. D'où le `pages project create` explicite, qui est correct sur
+les deux majeures.
+
+**wrangler tourne depuis le `node_modules` local, jamais en global.** Le template
+épingle `wrangler@^3.63.2` en devDependency ; `npm install` (étape précédente) installe
+donc déjà la bonne version dans `node_modules/.bin/wrangler` de chaque workDir. Un
+`npm install -g wrangler` résout toujours la dernière version, qui dérive de l'épingle
+du template dès qu'une nouvelle majeure sort — c'est exactement ce qui a cassé
+`pages project create` avec wrangler 4.
+
+`--branch` est explicite parce que `workDir` n'est pas un dépôt git : sans lui wrangler
+ne peut pas déduire qu'il s'agit de la branche de production et le déploiement part en
+preview au lieu de `<project>.pages.dev`.
+
+**Les custom domains sont attachés via l'API Cloudflare, pas wrangler.** Le CLI n'a
+aucune commande pour ça (`wrangler pages project` se limite à create/delete/list) — donc
+`POST /accounts/:account_id/pages/projects/:project_name/domains` avec
+`{ "name": "<domain>" }`, idempotent (une tentative sur un domaine déjà attaché échoue
+proprement côté API, loggé et ignoré). Ça n'enregistre le domaine que côté Pages ;
+l'enregistrement DNS (CNAME vers `<project>.pages.dev`) reste à la charge de
+l'utilisateur.
+
+Le projet Pages n'est jamais supprimé par le publisher — ni sur changement de mode, ni
+sur unpublish. C'est un appel destructeur dans le compte Cloudflare de l'utilisateur ;
+le site reste joignable sur `<project>.pages.dev` et doit être retiré à la main.
+
+**Le domaine de staging local (`<slug>.wstdwork.morain.fr`) reste fonctionnel.** Pages
+ne sert que sur `<project>.pages.dev` (+ les custom domains attachés) — sans rien de
+plus, le domaine de staging que le builder affiche toujours comme "site publié" 404
+puisque `/var/publish/<hostname>` est purgé à l'entrée en mode cloudflare. Le proxy
+(port `PROXY_PORT`) reverse-proxy donc ce domaine vers `<cfProjectName>.pages.dev` via
+la map `cfProjectHost` (hostname de staging → nom de projet), remplie à la publication
+et restaurée au démarrage depuis `state.json`. Un custom domain n'y entre jamais : son
+DNS pointe directement sur Cloudflare et ne repasse pas par le publisher.
 
 Les jobs sont sérialisés **par domaine** via une queue de promesses (`projectQueues`).
 
@@ -114,6 +155,7 @@ Les ports sont alloués dynamiquement à partir de `SSR_PORT_BASE + 1` (défaut:
 | `DOCKER_PORT_BASE` | Base des ports containers Docker (défaut: 6000 → premiers sites sur 6001, 6002…) |
 | `CLOUDFLARE_API_TOKEN` | Token Wrangler pour deploy CF Pages (mode `cloudflare`) |
 | `CLOUDFLARE_ACCOUNT_ID` | ID compte Cloudflare (mode `cloudflare`) |
+| `CLOUDFLARE_PRODUCTION_BRANCH` | Branche de production des projets Pages créés (défaut: `main`) |
 
 ## Points d'attention
 
