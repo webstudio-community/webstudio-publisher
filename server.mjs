@@ -518,29 +518,23 @@ const toCfProjectName = (domain) =>
  *   4. npm run build  (remix vite:build → build/client/)
  *   5. wrangler pages project create <cfProjectName>   (first time)
  *   6. wrangler pages deploy ./build/client --project-name <cfProjectName>
+ *   7. attach any custom domains to the Pages project (Cloudflare API — wrangler
+ *      has no CLI command for this)
  */
-let wranglerInstalled = false;
-const ensureWrangler = async () => {
-  if (wranglerInstalled) return;
-  try {
-    await execAsync("wrangler --version");
-    wranglerInstalled = true;
-  } catch {
-    log("Installing wrangler (first Cloudflare publish)...");
-    await execAsync("npm install -g wrangler");
-    wranglerInstalled = true;
-  }
-};
+// The cloudflare template pins wrangler (^3.63.2) as a devDependency, so `npm
+// install` in step 3 already gives every workDir its own pinned copy at
+// node_modules/.bin/wrangler. Run that one instead of a global install: a
+// global `npm install -g wrangler` always resolves to latest, which drifts
+// out from under the template's pin the moment a new wrangler major ships —
+// exactly what caused the wrangler 4 `pages project create` breakage below.
+const wranglerBin = "./node_modules/.bin/wrangler";
 
 /**
  * Create the Pages project unless it already exists.
  *
  * wrangler 3 created the project implicitly on the first `pages deploy`.
  * wrangler 4 removed that and hard-fails with `The Pages project "<name>"
- * does not exist`, so a first publish could never succeed. The cloudflare
- * template pins wrangler ^3.63.2, but ensureWrangler above installs the
- * latest globally and the global one is what runs here — so in practice this
- * always hits the wrangler 4 behaviour.
+ * does not exist`, so a first publish could never succeed.
  *
  * Creating up front is correct on both majors. A create against an existing
  * project exits non-zero, which is the normal path on every publish after the
@@ -551,7 +545,7 @@ const ensureWrangler = async () => {
 const ensureCfPagesProject = async (cfProjectName, run) => {
   try {
     await run(
-      `wrangler pages project create ${cfProjectName} --production-branch ${CF_PRODUCTION_BRANCH}`,
+      `${wranglerBin} pages project create ${cfProjectName} --production-branch ${CF_PRODUCTION_BRANCH}`,
       {
         CLOUDFLARE_API_TOKEN: CF_API_TOKEN,
         CLOUDFLARE_ACCOUNT_ID: CF_ACCOUNT_ID,
@@ -565,9 +559,45 @@ const ensureCfPagesProject = async (cfProjectName, run) => {
   }
 };
 
+/**
+ * Attach a custom domain to a Pages project via the Cloudflare API.
+ *
+ * wrangler has no CLI command for this (`wrangler pages project` is limited
+ * to create/delete/list — see `--help`), so this is the only way to automate
+ * it. Attaching only registers the domain on the Pages project; Cloudflare
+ * still needs a DNS record (typically a CNAME to `<project>.pages.dev`)
+ * pointing at it, which is the user's to create — same division of
+ * responsibility as the Pages project itself never being deleted.
+ *
+ * Idempotent: attaching a domain that is already attached to this project
+ * returns an error from the API, which is logged and swallowed so a
+ * republish doesn't fail on it. A domain attached to a *different* Pages
+ * project fails the same way and needs the user's attention, which the
+ * logged error message provides.
+ */
+const ensureCfPagesDomain = async (cfProjectName, domain) => {
+  const response = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${cfProjectName}/domains`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${CF_API_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ name: domain }),
+    }
+  );
+  const result = await response.json();
+  if (result.success) {
+    log(`Attached custom domain "${domain}" to Cloudflare Pages project "${cfProjectName}"`);
+  } else {
+    const message = result.errors?.[0]?.message ?? response.statusText;
+    log(`Custom domain "${domain}" was not attached to "${cfProjectName}" (it most likely already is): ${message}`);
+  }
+};
+
 const publishBuildCloudflare = async ({ buildId }) => {
   log(`Starting Cloudflare publish for build ${buildId}`);
-  await ensureWrangler();
 
   const { projectDomain: domain, customDomains } = await getProjectBuildInfo(buildId);
   log(`Project domain: ${domain}`);
@@ -666,14 +696,23 @@ const publishBuildCloudflare = async ({ buildId }) => {
   // infer, wrangler cannot tell this is the production branch and the build
   // lands on a preview URL instead of <project>.pages.dev.
   await run(
-    `wrangler pages deploy ./build/client --project-name ${cfProjectName} --branch ${CF_PRODUCTION_BRANCH}`,
+    `${wranglerBin} pages deploy ./build/client --project-name ${cfProjectName} --branch ${CF_PRODUCTION_BRANCH}`,
     {
       CLOUDFLARE_API_TOKEN: CF_API_TOKEN,
       CLOUDFLARE_ACCOUNT_ID: CF_ACCOUNT_ID,
     }
   );
 
-  // 6. Persist state. Nothing restores anything for this mode — Pages runs the
+  // 6. Attach custom domains to the Pages project. wrangler's CLI has no
+  // command for this (only `pages project create/delete/list`), so it goes
+  // through the Cloudflare API directly. Each domain still needs its own DNS
+  // record pointing at the project — this only registers it on the Pages
+  // side — and a domain already attached (republish) is left alone.
+  for (const customDomain of customDomains) {
+    await ensureCfPagesDomain(cfProjectName, customDomain);
+  }
+
+  // 7. Persist state. Nothing restores anything for this mode — Pages runs the
   // site — but unpublish and delete look the site up by hostname here, and
   // without a record they cannot see a Cloudflare site at all.
   await writeFile(
