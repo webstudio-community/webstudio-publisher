@@ -11,7 +11,8 @@
  *
  * SSR proxy (port PROXY_PORT, default 4001):
  *   Serves all published sites — SSR domains are proxied to their Docker container,
- *   SSG domains are served directly from /var/publish/<domain>/.
+ *   SSG domains are served directly from /var/publish/<domain>/, and the local staging
+ *   domain of a cloudflare-mode site is reverse-proxied to <cfProjectName>.pages.dev.
  *   The self-host stack should route *.PUBLISHER_HOST traffic to this port.
  *
  * Environment variables:
@@ -24,6 +25,7 @@
  */
 
 import { createServer, request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { exec, spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
 import { mkdir, cp, rm, access, readdir, readFile, writeFile, stat } from "node:fs/promises";
@@ -209,6 +211,13 @@ const restoreSsrProcesses = async () => {
         for (const cd of customDomains) dockerHostContainer.set(cd, containerName);
 
         log(`Restored Docker container ${containerName} for ${domain}`);
+
+      } else if (state.mode === "cloudflare") {
+        // Nothing to start — Cloudflare Pages runs the site. Only the local
+        // staging domain is registered: a custom domain's DNS points straight
+        // at Cloudflare and never reaches this proxy.
+        cfProjectHost.set(state.publishDomain, state.cfProjectName);
+        log(`Restored Cloudflare Pages routing for ${domain} → ${state.cfProjectName}.pages.dev`);
       }
     } catch {
       // No state.json or invalid JSON — skip
@@ -462,6 +471,12 @@ const patchDataFilesForPrerender = async (dir) => {
 // The proxy connects to <containerName>:3000 on DOCKER_NETWORK.
 const dockerHostContainer = new Map();
 
+// hostname (local staging domain only) → Cloudflare Pages project name.
+// The proxy reverse-proxies to <cfProjectName>.pages.dev so the staging URL
+// keeps working after a site moves to Cloudflare — a custom domain never
+// goes through this map, its DNS points straight at Cloudflare.
+const cfProjectHost = new Map();
+
 // ─── Docker mode: site Dockerfile template ───────────────────────────────────
 
 // Multi-stage Dockerfile written into each domain's workDir before `docker build`.
@@ -712,9 +727,11 @@ const publishBuildCloudflare = async ({ buildId }) => {
     await ensureCfPagesDomain(cfProjectName, customDomain);
   }
 
-  // 7. Persist state. Nothing restores anything for this mode — Pages runs the
-  // site — but unpublish and delete look the site up by hostname here, and
-  // without a record they cannot see a Cloudflare site at all.
+  // 7. Persist state and register the staging domain with the proxy, so
+  // `<publishDomain>` reverse-proxies to `<cfProjectName>.pages.dev` instead
+  // of 404ing — Pages itself needs no local process, but unpublish, delete,
+  // and the proxy all look the site up by hostname here.
+  cfProjectHost.set(publishDomain, cfProjectName);
   await writeFile(
     stateFile,
     JSON.stringify({ mode: "cloudflare", cfProjectName, publishDomain, customDomains }, null, 2) + "\n",
@@ -761,6 +778,10 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
       // Deleting the Pages project is a destructive call into the user's
       // Cloudflare account, so it is left alone deliberately. Say so, because
       // the site stays reachable at <project>.pages.dev after this publish.
+      // The staging domain, though, now serves this SSG build again — drop
+      // its reverse-proxy route or it would keep going to the old Cloudflare
+      // deployment instead of the fresh /var/publish output below.
+      cfProjectHost.delete(prevState.publishDomain);
       log(`${domain} was on Cloudflare Pages — project "${prevState.cfProjectName}" left in place and still live`);
       await rm(stateFile, { force: true });
     }
@@ -998,7 +1019,10 @@ const publishBuildSsr = async ({ buildId }) => {
       stopSsrForDomain(domain, prevState.publishDomain, prevState.customDomains ?? []);
       log(`Stopped SSR process for ${domain} (switching to Docker)`);
     } else if (prevState.mode === "cloudflare") {
-      // Same as the SSG path: the Pages project is the user's to delete.
+      // Same as the SSG path: the Pages project is the user's to delete. The
+      // staging domain moves to this Docker container instead, so drop its
+      // reverse-proxy route or it would keep going to Cloudflare.
+      cfProjectHost.delete(prevState.publishDomain);
       log(`${domain} was on Cloudflare Pages — project "${prevState.cfProjectName}" left in place and still live`);
     }
     // mode: "docker" → old container is stopped in step 6 below
@@ -1164,6 +1188,37 @@ const proxyServer = createServer(async (req, res) => {
       if (!res.headersSent) {
         res.writeHead(502);
         res.end("SSR proxy error");
+      }
+    });
+    req.pipe(proxyReq, { end: true });
+    return;
+  }
+
+  // Cloudflare Pages: reverse-proxy to <cfProjectName>.pages.dev so the local
+  // staging domain keeps working after a site moves to Cloudflare, instead of
+  // 404ing on the now-empty /var/publish/<host>/. Host is rewritten to the
+  // pages.dev hostname — that's what Cloudflare routes on.
+  const cfProjectName = cfProjectHost.get(host);
+  if (cfProjectName !== undefined) {
+    const pagesHost = `${cfProjectName}.pages.dev`;
+    const proxyReq = httpsRequest(
+      {
+        hostname: pagesHost,
+        port: 443,
+        path: req.url,
+        method: req.method,
+        headers: { ...req.headers, host: pagesHost },
+      },
+      (proxyRes) => {
+        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+        proxyRes.pipe(res, { end: true });
+      }
+    );
+    proxyReq.on("error", (err) => {
+      logErr(`Cloudflare Pages proxy error for ${host} → ${pagesHost}: ${err.message}`);
+      if (!res.headersSent) {
+        res.writeHead(502);
+        res.end("Cloudflare Pages proxy error");
       }
     });
     req.pipe(proxyReq, { end: true });

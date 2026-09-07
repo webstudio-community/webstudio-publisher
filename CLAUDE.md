@@ -113,6 +113,15 @@ Le projet Pages n'est jamais supprimé par le publisher — ni sur changement de
 sur unpublish. C'est un appel destructeur dans le compte Cloudflare de l'utilisateur ;
 le site reste joignable sur `<project>.pages.dev` et doit être retiré à la main.
 
+**Le domaine de staging local (`<slug>.wstdwork.morain.fr`) reste fonctionnel.** Pages
+ne sert que sur `<project>.pages.dev` (+ les custom domains attachés) — sans rien de
+plus, le domaine de staging que le builder affiche toujours comme "site publié" 404
+puisque `/var/publish/<hostname>` est purgé à l'entrée en mode cloudflare. Le proxy
+(port `PROXY_PORT`) reverse-proxy donc ce domaine vers `<cfProjectName>.pages.dev` via
+la map `cfProjectHost` (hostname de staging → nom de projet), remplie à la publication
+et restaurée au démarrage depuis `state.json`. Un custom domain n'y entre jamais : son
+DNS pointe directement sur Cloudflare et ne repasse pas par le publisher.
+
 Les jobs sont sérialisés **par domaine** via une queue de promesses (`projectQueues`).
 
 ## Proxy de sites (port PROXY_PORT)
