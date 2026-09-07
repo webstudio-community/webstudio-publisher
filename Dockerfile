@@ -72,7 +72,9 @@ RUN chmod +x /opt/webstudio-cli/bin.js \
 # wrangler is installed on-demand at first Cloudflare publish (saves ~150 MB for non-CF users)
 
 # docker CLI for buildMode: "docker" — requires /var/run/docker.sock mounted at runtime
-RUN apk add --no-cache docker-cli docker-cli-buildx
+# rsync + openssh-client for buildMode: "ssh" — deploy SSG output to a remote server
+# curl + jq — call the build API (e.g. /targets/ssh-setup) from `docker compose exec`
+RUN apk add --no-cache docker-cli docker-cli-buildx rsync openssh-client curl jq
 
 WORKDIR /app
 

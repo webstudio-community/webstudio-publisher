@@ -8,6 +8,8 @@
  *   ssg        — Vite prerender → static files in /var/publish/<domain>/
  *   cloudflare — React Router build + wrangler pages deploy
  *   ssr        — React Router build → docker build + docker run, one container per domain
+ *   ssh        — Vite prerender → rsync to a remote server over SSH
+ *                (target configured once per domain via POST /targets/ssh-setup)
  *
  * SSR proxy (port PROXY_PORT, default 4001):
  *   Serves all published sites — SSR domains are proxied to their Docker container,
@@ -26,7 +28,7 @@
 import { createServer, request as httpRequest } from "node:http";
 import { exec, spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
-import { mkdir, cp, rm, access, readdir, readFile, writeFile, stat } from "node:fs/promises";
+import { mkdir, cp, rm, access, readdir, readFile, writeFile, stat, chmod } from "node:fs/promises";
 import { join, extname } from "node:path";
 import { promisify } from "node:util";
 import { networkInterfaces } from "node:os";
@@ -452,6 +454,40 @@ const patchDataFilesForPrerender = async (dir) => {
   }
 };
 
+/**
+ * Qualify a bare project slug (no dot) with PUBLISHER_HOST so it matches the
+ * full hostname the proxy / Nginx serves from. Custom domains are used as-is.
+ */
+const qualifyPublishDomain = (domain) =>
+  !domain.includes(".") && PUBLISHER_HOST ? `${domain}.${PUBLISHER_HOST}` : domain;
+
+/**
+ * Walk a directory and rewrite every .html / .xml file through `transform`.
+ * .xml is included because the sitemaps protocol requires absolute URLs under
+ * the host serving the sitemap, so each domain's copy is rewritten like the HTML.
+ */
+const transformOutputFiles = async (dir, transform) => {
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const fullPath = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      await transformOutputFiles(fullPath, transform);
+    } else if (entry.name.endsWith(".html") || entry.name.endsWith(".xml")) {
+      const content = await readFile(fullPath, "utf8");
+      const fixed = transform(content);
+      if (fixed !== content) {
+        await writeFile(fullPath, fixed, "utf8");
+        log(`  Updated URLs in ${fullPath}`);
+      }
+    }
+  }
+};
+
 // ─── Docker mode: container routing ──────────────────────────────────────────
 
 // hostname (publishDomain or customDomain) → Docker container name
@@ -584,43 +620,16 @@ const publishBuildCloudflare = async ({ buildId }) => {
 };
 
 /**
- * Generate static files for the given build and write to /var/publish/<domain>/.
- * If the domain previously had an SSR process running, it is stopped first.
+ * Sync the build data and produce the static SSG output in workDir/dist/client/.
+ *
+ * Shared by the local SSG pipeline (publishBuild) and the remote SSH pipeline
+ * (publishBuildSsh): both need the exact same sync → generate → vite build, they
+ * only differ in what they do with the resulting directory.
+ *
+ * Absolute URLs in the output are rewritten to `publicOrigin` (og:url, sitemap
+ * <loc>, and og:image/twitter:image are made absolute). Returns the dist dir.
  */
-const publishBuild = async ({ buildId, builderOrigin }) => {
-  log(`Starting SSG publish for build ${buildId}`);
-
-  const { projectDomain: domain, customDomains } = await getProjectBuildInfo(buildId);
-  log(`Project domain: ${domain}`);
-  if (customDomains.length > 0) {
-    log(`Custom domains: ${customDomains.join(", ")}`);
-  }
-
-  // Nginx / proxy serves from /var/publish/$host — for wstd slugs (no dot), append
-  // PUBLISHER_HOST to match the full hostname. Custom domains are used as-is.
-  const publishDomain =
-    !domain.includes(".") && PUBLISHER_HOST
-      ? `${domain}.${PUBLISHER_HOST}`
-      : domain;
-
-  const workDir = join(WORK_DIR, domain);
-  await mkdir(workDir, { recursive: true });
-
-  // Handle mode transitions → ssg
-  const stateFile = join(workDir, "state.json");
-  try {
-    const prevState = JSON.parse(await readFile(stateFile, "utf8"));
-    if (prevState.mode === "ssr") {
-      stopSsrForDomain(domain, prevState.publishDomain, prevState.customDomains ?? []);
-      await rm(stateFile, { force: true });
-    } else if (prevState.mode === "docker") {
-      await stopDockerForDomain(domain, prevState.containerName, prevState.publishDomain, prevState.customDomains ?? []);
-      await rm(stateFile, { force: true });
-    }
-  } catch {
-    // No state.json or unknown mode — nothing to stop
-  }
-
+const buildSsgOutput = async ({ buildId, domain, workDir, publicOrigin }) => {
   const run = async (cmd) => {
     log(`  $ ${cmd}`);
     const { stdout, stderr } = await execAsync(cmd, { cwd: workDir, maxBuffer: 10 * 1024 * 1024 });
@@ -731,30 +740,9 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
   }
 
   // 4b. Fix absolute URLs in generated output:
-  //   - og:url leaks the Docker-internal origin (e.g. http://app:3000) → replace with public HTTPS domain
+  //   - og:url leaks the Docker-internal origin (e.g. http://app:3000) → replace with the public origin
   //   - og:image / twitter:image are relative paths → make absolute for social scrapers
   //   - sitemap.xml <loc> entries carry the same internal origin
-  // .xml is included because the sitemaps protocol requires absolute URLs that
-  // sit under the host serving the sitemap, so each domain's copy below has to
-  // be rewritten just like the HTML.
-  const publicOrigin = `https://${publishDomain}`;
-  const transformOutputFiles = async (dir, transform) => {
-    let entries;
-    try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
-    for (const entry of entries) {
-      const fullPath = join(dir, entry.name);
-      if (entry.isDirectory()) {
-        await transformOutputFiles(fullPath, transform);
-      } else if (entry.name.endsWith(".html") || entry.name.endsWith(".xml")) {
-        const content = await readFile(fullPath, "utf8");
-        const fixed = transform(content);
-        if (fixed !== content) {
-          await writeFile(fullPath, fixed, "utf8");
-          log(`  Updated URLs in ${fullPath}`);
-        }
-      }
-    }
-  };
   log(`Fixing absolute URLs in generated output...`);
   await transformOutputFiles(distDir, (html) => {
     let out = html.replaceAll(BUILDER_INTERNAL_URL, publicOrigin);
@@ -762,6 +750,49 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
     out = out.replace(/(name="twitter:image"\s+content=")(\/[^"]*)/g, (_, prefix, path) => `${prefix}${publicOrigin}${path}`);
     return out;
   });
+
+  return distDir;
+};
+
+/**
+ * Generate static files for the given build and write to /var/publish/<domain>/.
+ * If the domain previously had an SSR process running, it is stopped first.
+ */
+const publishBuild = async ({ buildId }) => {
+  log(`Starting SSG publish for build ${buildId}`);
+
+  const { projectDomain: domain, customDomains } = await getProjectBuildInfo(buildId);
+  log(`Project domain: ${domain}`);
+  if (customDomains.length > 0) {
+    log(`Custom domains: ${customDomains.join(", ")}`);
+  }
+
+  const publishDomain = qualifyPublishDomain(domain);
+
+  const workDir = join(WORK_DIR, domain);
+  await mkdir(workDir, { recursive: true });
+
+  // Handle mode transitions → ssg
+  const stateFile = join(workDir, "state.json");
+  try {
+    const prevState = JSON.parse(await readFile(stateFile, "utf8"));
+    if (prevState.mode === "ssr") {
+      stopSsrForDomain(domain, prevState.publishDomain, prevState.customDomains ?? []);
+      await rm(stateFile, { force: true });
+    } else if (prevState.mode === "docker") {
+      await stopDockerForDomain(domain, prevState.containerName, prevState.publishDomain, prevState.customDomains ?? []);
+      await rm(stateFile, { force: true });
+    } else if (prevState.mode === "ssh") {
+      // Was published to a remote server; now serving locally again. The remote
+      // copy is left untouched (see publishBuildSsh / teardownSite).
+      await rm(stateFile, { force: true });
+    }
+  } catch {
+    // No state.json or unknown mode — nothing to stop
+  }
+
+  const publicOrigin = `https://${publishDomain}`;
+  const distDir = await buildSsgOutput({ buildId, domain, workDir, publicOrigin });
 
   // 5. Copy built files to the serve directory
   const destDir = join(PUBLISH_DIR, publishDomain);
@@ -781,6 +812,118 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
   }
 
   log(`Successfully published ${domain}`);
+};
+
+// ─── Remote SSH pipeline (SSG → rsync to a remote server) ────────────────────
+
+/**
+ * Read the per-domain SSH target config written by POST /targets/ssh-setup.
+ * Returns undefined if the site has no SSH target configured.
+ */
+const readSshTarget = async (workDir) => {
+  try {
+    return JSON.parse(await readFile(join(workDir, "target.json"), "utf8"));
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * Stop whatever was serving a site locally and drop its local traces, because
+ * the site is moving to a remote server. Best-effort — a missing container or
+ * file must not stop the publish.
+ */
+const stopLocalServing = async (domain, prevState) => {
+  const hostnames = [prevState.publishDomain, ...(prevState.customDomains ?? [])].filter(Boolean);
+  if (prevState.mode === "ssr") {
+    stopSsrForDomain(domain, prevState.publishDomain, prevState.customDomains ?? []);
+  } else if (prevState.mode === "docker") {
+    await stopDockerForDomain(domain, prevState.containerName, prevState.publishDomain, prevState.customDomains ?? []);
+  }
+  for (const hostname of hostnames) {
+    await rm(join(PUBLISH_DIR, hostname), { recursive: true, force: true });
+    await removeTraefikRouteForDomain(hostname);
+  }
+};
+
+/**
+ * Publish a build as SSG and rsync it to a remote server over SSH.
+ *
+ * The SSH target (host/user/path/port + private key) is configured once per
+ * domain via POST /targets/ssh-setup and stored under /var/work/<domain>/.
+ *
+ * Workflow:
+ *   1. read target.json  (fail with instructions if the site has no SSH target)
+ *   2. stop any local runtime / static copy for this site
+ *   3. buildSsgOutput()  (sync → build ssg → vite build → rewrite URLs)
+ *   4. rsync -az --delete dist/client/ → user@host:path/
+ *   5. persist state.json { mode: "ssh", ... }
+ *
+ * The publisher does not serve the site and writes no Traefik config — TLS and
+ * routing on the remote server are the user's responsibility.
+ */
+const publishBuildSsh = async ({ buildId }) => {
+  log(`Starting SSH publish for build ${buildId}`);
+
+  const { projectDomain: domain, customDomains } = await getProjectBuildInfo(buildId);
+  log(`Project domain: ${domain}`);
+
+  const publishDomain = qualifyPublishDomain(domain);
+  const workDir = join(WORK_DIR, domain);
+  await mkdir(workDir, { recursive: true });
+
+  const target = await readSshTarget(workDir);
+  if (target === undefined) {
+    throw new Error(
+      `No SSH target configured for "${domain}". Configure one first:\n` +
+        `  curl -X POST <publisher>/targets/ssh-setup -H 'content-type: application/json' -d '{"domain":"${domain}","sshHost":"…","sshUser":"…","sshPath":"…","sshPrivateKey":"…"}'`
+    );
+  }
+  const { sshHost, sshUser, sshPath, sshPort = 22, publicUrl } = target;
+
+  // Handle mode transitions → ssh
+  const stateFile = join(workDir, "state.json");
+  try {
+    const prevState = JSON.parse(await readFile(stateFile, "utf8"));
+    if (prevState.mode !== "ssh") {
+      await stopLocalServing(domain, prevState);
+      log(`Stopped local serving for ${domain} (switching to SSH)`);
+    }
+  } catch {
+    // No state.json — new domain
+  }
+
+  // The origin baked into the output: an explicit publicUrl wins, else the first
+  // custom domain, else the wstd hostname (rarely what actually serves an SSH site).
+  const publicOrigin =
+    publicUrl ??
+    (customDomains.length > 0 ? `https://${customDomains[0]}` : `https://${publishDomain}`);
+
+  const distDir = await buildSsgOutput({ buildId, domain, workDir, publicOrigin });
+
+  // rsync to the remote server. accept-new trusts the host key on first contact
+  // and pins it afterwards (POST /targets/ssh-setup also pre-seeds known_hosts).
+  const keyPath = join(workDir, "ssh_key");
+  const knownHostsPath = join(workDir, "known_hosts");
+  const sshCmd = `ssh -p ${sshPort} -i ${keyPath} -o UserKnownHostsFile=${knownHostsPath} -o StrictHostKeyChecking=accept-new`;
+  const rsyncCmd = `rsync -az --delete -e "${sshCmd}" ${distDir}/ ${sshUser}@${sshHost}:${sshPath}/`;
+  log(`Deploying ${domain} to ${sshUser}@${sshHost}:${sshPath} ...`);
+  log(`  $ ${rsyncCmd}`);
+  const { stdout, stderr } = await execAsync(rsyncCmd, { cwd: workDir, maxBuffer: 10 * 1024 * 1024 });
+  if (stdout) log(`  stdout: ${stdout.trim()}`);
+  if (stderr) log(`  stderr: ${stderr.trim()}`);
+
+  await writeFile(
+    stateFile,
+    JSON.stringify(
+      { mode: "ssh", publishDomain, customDomains, sshHost, sshPath, publicUrl: publicOrigin },
+      null,
+      2
+    ) + "\n",
+    "utf8"
+  );
+
+  log(`Successfully published ${domain} to ${sshHost}`);
 };
 
 // ─── SSR build pipeline (Docker containers) ──────────────────────────────────
@@ -1077,6 +1220,10 @@ const teardownSite = async (domain, state) => {
     // their account with different semantics from the local modes, so it is
     // deliberately left out here.
     log(`Cloudflare Pages project for ${domain} was NOT deleted — remove it from the Cloudflare dashboard`);
+  } else if (mode === "ssh") {
+    // The site lives on a remote server the publisher does not own. The rsynced
+    // files are left in place — remove them on the remote server if needed.
+    log(`${domain} was published over SSH to ${state.sshHost ?? "a remote server"} — remote files were NOT removed`);
   }
 
   for (const hostname of hostnames) {
@@ -1156,7 +1303,12 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      if (buildMode !== "ssg" && buildMode !== "cloudflare" && buildMode !== "ssr") {
+      if (
+        buildMode !== "ssg" &&
+        buildMode !== "cloudflare" &&
+        buildMode !== "ssr" &&
+        buildMode !== "ssh"
+      ) {
         res.writeHead(400);
         res.end(`Unknown buildMode: ${buildMode}`);
         return;
@@ -1178,7 +1330,9 @@ const server = createServer(async (req, res) => {
           ? () => publishBuildCloudflare({ buildId })
           : buildMode === "ssr"
             ? () => publishBuildSsr({ buildId })
-            : () => publishBuild({ buildId, builderOrigin });
+            : buildMode === "ssh"
+              ? () => publishBuildSsh({ buildId })
+              : () => publishBuild({ buildId });
 
       q.current = q.current
         .then(job)
@@ -1189,6 +1343,77 @@ const server = createServer(async (req, res) => {
             logErr(`Failed to notify FAILED status for ${buildId}: ${notifyErr.message}`)
           );
         });
+    });
+    return;
+  }
+
+  // Configure the SSH target for a domain (buildMode "ssh"). Done once per site —
+  // the private key is not sent on every publish. Stores:
+  //   /var/work/<domain>/ssh_key      private key, chmod 600, never logged
+  //   /var/work/<domain>/target.json  { sshHost, sshUser, sshPath, sshPort, publicUrl }
+  if (req.method === "POST" && req.url === "/targets/ssh-setup") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", async () => {
+      let input;
+      try {
+        input = JSON.parse(body);
+      } catch {
+        res.writeHead(400);
+        res.end("Invalid JSON");
+        return;
+      }
+      const { domain, sshHost, sshUser, sshPath, sshPort = 22, sshPrivateKey, publicUrl } = input;
+      const missing = ["domain", "sshHost", "sshUser", "sshPath", "sshPrivateKey"].filter(
+        (k) => !input[k]
+      );
+      if (missing.length > 0) {
+        res.writeHead(400);
+        res.end(`Missing field(s): ${missing.join(", ")}`);
+        return;
+      }
+      try {
+        const workDir = join(WORK_DIR, domain);
+        await mkdir(workDir, { recursive: true });
+
+        const keyPath = join(workDir, "ssh_key");
+        await writeFile(
+          keyPath,
+          sshPrivateKey.endsWith("\n") ? sshPrivateKey : sshPrivateKey + "\n",
+          "utf8"
+        );
+        await chmod(keyPath, 0o600);
+
+        await writeFile(
+          join(workDir, "target.json"),
+          JSON.stringify(
+            { mode: "ssh", sshHost, sshUser, sshPath, sshPort, publicUrl: publicUrl ?? null },
+            null,
+            2
+          ) + "\n",
+          "utf8"
+        );
+
+        // Pre-seed known_hosts so the first rsync does not have to trust blindly.
+        try {
+          const { stdout } = await execAsync(`ssh-keyscan -p ${sshPort} -H ${sshHost}`, {
+            maxBuffer: 1024 * 1024,
+          });
+          if (stdout.trim()) {
+            await writeFile(join(workDir, "known_hosts"), stdout, "utf8");
+          }
+        } catch {
+          log(`ssh-keyscan failed for ${sshHost} — first publish will trust the host key on contact`);
+        }
+
+        log(`Configured SSH target for ${domain}: ${sshUser}@${sshHost}:${sshPath}`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true }));
+      } catch (error) {
+        logErr(`ssh-setup failed for ${input.domain}: ${error.message}`);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: error.message }));
+      }
     });
     return;
   }
@@ -1226,7 +1451,7 @@ const server = createServer(async (req, res) => {
 
   if (req.method === "GET" && req.url === "/capabilities") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ cloudflare: !!(CF_API_TOKEN && CF_ACCOUNT_ID) }));
+    res.end(JSON.stringify({ cloudflare: !!(CF_API_TOKEN && CF_ACCOUNT_ID), ssh: true }));
     return;
   }
 

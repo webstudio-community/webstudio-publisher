@@ -81,6 +81,34 @@ POST /publish { buildId, builderOrigin, buildMode: "cloudflare" }
 
 Requiert `CLOUDFLARE_API_TOKEN` et `CLOUDFLARE_ACCOUNT_ID`. Le projet CF Pages est créé automatiquement par wrangler s'il n'existe pas.
 
+### `ssh` — SSG puis rsync vers un serveur distant
+
+```
+POST /targets/ssh-setup { domain, sshHost, sshUser, sshPath, sshPort?, sshPrivateKey, publicUrl? }
+  → écrit /var/work/<domain>/ssh_key (chmod 600, jamais loggée)
+  → écrit /var/work/<domain>/target.json { mode: "ssh", sshHost, sshUser, sshPath, sshPort, publicUrl }
+  → ssh-keyscan → /var/work/<domain>/known_hosts (best-effort)
+
+POST /publish { buildId, builderOrigin, buildMode: "ssh" }
+  → lecture target.json (échec + instructions curl si absent)
+  → arrêt du service local précédent (container / process / statique + YAML Traefik)
+  → buildSsgOutput() : sync → build ssg → vite build → réécriture URLs vers publicUrl
+    (publicUrl explicite, sinon 1er custom domain, sinon <slug>.PUBLISHER_HOST)
+  → rsync -az --delete -e "ssh -p … -i ssh_key -o UserKnownHostsFile=known_hosts
+      -o StrictHostKeyChecking=accept-new" dist/client/ user@host:path/
+  → state.json { mode: "ssh", publishDomain, customDomains, sshHost, sshPath, publicUrl }
+```
+
+Le publisher ne sert pas le hostname et n'écrit pas de config Traefik : TLS et routage
+du serveur distant sont à la charge de l'utilisateur. Sur unpublish / changement de
+mode, les fichiers déjà rsyncés sont **laissés en place** sur le serveur distant.
+
+Prérequis image : `rsync` + `openssh-client` (ajoutés au `Dockerfile`).
+Prérequis serveur distant : `rsync` + un serveur web servant `sshPath`.
+
+`GET /capabilities` renvoie `{ cloudflare, ssh }` (`ssh` toujours `true` — aucun
+prérequis instance-wide ; la config est par site via `/targets/ssh-setup`).
+
 Les jobs sont sérialisés **par domaine** via une queue de promesses (`projectQueues`).
 
 ## Proxy de sites (port PROXY_PORT)
