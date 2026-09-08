@@ -1028,31 +1028,20 @@ const toDockerName = (domain) =>
     .replace(/^-+|-+$/g, "");
 
 /**
- * Publish an SSR site as an isolated Docker container.
+ * Sync the build, generate the react-router-docker project, and produce a
+ * Docker image tagged `imageTag` in the local daemon. Shared by the local SSR
+ * pipeline (publishBuildSsr → `docker run`) and the remote Coolify pipeline
+ * (publishBuildCoolifySsr → `docker push` to a registry).
  *
  * Workflow:
  *   1. webstudio sync
  *   2. webstudio build --template docker
- *   3. Write DOCKER_SITE_DOCKERFILE into workDir
- *   4. docker build -t <image> .   ← built ONCE, reused for all hostnames
- *   5. docker stop/rm old container + docker run new one
- *   6. docker image prune -f
- *   7. Persist state.json + register all hostnames in dockerHostContainer (proxy)
+ *   2b. patch [_image].$.ts (ipx storage + disk cache)
+ *   2c. write patch-navlink.cjs (run inside the build)
+ *   3. write DOCKER_SITE_DOCKERFILE
+ *   4. docker build -t <imageTag> .
  */
-const publishBuildSsr = async ({ buildId }) => {
-  log(`Starting Docker publish for build ${buildId}`);
-
-  const { projectDomain: domain, customDomains } = await getProjectBuildInfo(buildId);
-  log(`Project domain: ${domain}`);
-  if (customDomains.length > 0) {
-    log(`Custom domains: ${customDomains.join(", ")}`);
-  }
-
-  const publishDomain = qualifyPublishDomain(domain);
-
-  const workDir = join(WORK_DIR, domain);
-  await mkdir(workDir, { recursive: true });
-
+const buildDockerImage = async ({ buildId, domain, workDir, imageTag }) => {
   const run = async (cmd, extraEnv = {}) => {
     log(`  $ ${cmd}`);
     const { stdout, stderr } = await execAsync(cmd, {
@@ -1063,26 +1052,6 @@ const publishBuildSsr = async ({ buildId }) => {
     if (stdout) log(`  stdout: ${stdout.trim()}`);
     if (stderr) log(`  stderr: ${stderr.trim()}`);
   };
-
-  // Handle mode transitions → docker
-  const stateFile = join(workDir, "state.json");
-  try {
-    const prevState = JSON.parse(await readFile(stateFile, "utf8"));
-    if (prevState.mode === "ssg") {
-      // Remove stale static files so the proxy stops serving them directly
-      for (const h of [prevState.publishDomain ?? publishDomain, ...(prevState.customDomains ?? [])]) {
-        await rm(join(PUBLISH_DIR, h), { recursive: true, force: true });
-      }
-      log(`Removed stale SSG output for ${domain}`);
-    } else if (prevState.mode === "cloudflare") {
-      // Same as the SSG path: the Pages project is the user's to delete. The
-      // staging domain moves to this Docker container instead, so drop its
-      // reverse-proxy route or it would keep going to Cloudflare.
-      cfProjectHost.delete(prevState.publishDomain);
-      log(`${domain} was on Cloudflare Pages — project "${prevState.cfProjectName}" left in place and still live`);
-    }
-    // mode: "docker" → old container is stopped in step 6 below
-  } catch { /* no state.json — new domain */ }
 
   // 1. Sync build data
   log(`Syncing build data for ${domain}...`);
@@ -1150,12 +1119,66 @@ if (patched !== c) {
   await writeFile(join(workDir, "Dockerfile"), DOCKER_SITE_DOCKERFILE, "utf8");
   log(`Wrote Dockerfile for ${domain}`);
 
-  // 4. Build image once — shared across all hostnames (@m8jj skip-build pattern)
-  const imageName = toDockerName(domain);
-  log(`Building Docker image ${imageName}...`);
-  await run(`docker build -t ${imageName} .`, { DOCKER_BUILDKIT: "1" });
+  // 4. Build the image
+  log(`Building Docker image ${imageTag}...`);
+  await run(`docker build -t ${imageTag} .`, { DOCKER_BUILDKIT: "1" });
+};
 
-  // 5. Stop/remove old container + start fresh one on the shared Docker network
+/**
+ * Publish an SSR site as an isolated Docker container on this host.
+ *
+ * buildDockerImage() → docker stop/rm + docker run → prune → state.json +
+ * register every hostname in dockerHostContainer (the proxy reverses to
+ * <container>:3000 on DOCKER_NETWORK).
+ */
+const publishBuildSsr = async ({ buildId }) => {
+  log(`Starting Docker publish for build ${buildId}`);
+
+  const { projectDomain: domain, customDomains } = await getProjectBuildInfo(buildId);
+  log(`Project domain: ${domain}`);
+  if (customDomains.length > 0) {
+    log(`Custom domains: ${customDomains.join(", ")}`);
+  }
+
+  const publishDomain = qualifyPublishDomain(domain);
+  const workDir = join(WORK_DIR, domain);
+  await mkdir(workDir, { recursive: true });
+
+  const run = async (cmd, extraEnv = {}) => {
+    log(`  $ ${cmd}`);
+    const { stdout, stderr } = await execAsync(cmd, {
+      cwd: workDir,
+      maxBuffer: 10 * 1024 * 1024,
+      env: { ...process.env, ...extraEnv },
+    });
+    if (stdout) log(`  stdout: ${stdout.trim()}`);
+    if (stderr) log(`  stderr: ${stderr.trim()}`);
+  };
+
+  // Handle mode transitions → docker
+  const stateFile = join(workDir, "state.json");
+  try {
+    const prevState = JSON.parse(await readFile(stateFile, "utf8"));
+    if (prevState.mode === "ssg") {
+      // Remove stale static files so the proxy stops serving them directly
+      for (const h of [prevState.publishDomain ?? publishDomain, ...(prevState.customDomains ?? [])]) {
+        await rm(join(PUBLISH_DIR, h), { recursive: true, force: true });
+      }
+      log(`Removed stale SSG output for ${domain}`);
+    } else if (prevState.mode === "cloudflare") {
+      // Same as the SSG path: the Pages project is the user's to delete. The
+      // staging domain moves to this Docker container instead, so drop its
+      // reverse-proxy route or it would keep going to Cloudflare.
+      cfProjectHost.delete(prevState.publishDomain);
+      log(`${domain} was on Cloudflare Pages — project "${prevState.cfProjectName}" left in place and still live`);
+    }
+    // mode: "docker" → old container is stopped below
+  } catch { /* no state.json — new domain */ }
+
+  const imageName = toDockerName(domain);
+  await buildDockerImage({ buildId, domain, workDir, imageTag: imageName });
+
+  // Stop/remove old container + start fresh one on the shared Docker network
   const containerName = imageName;
   log(`Deploying container ${containerName}...`);
   try { await run(`docker stop ${containerName}`); } catch {}
@@ -1164,17 +1187,16 @@ if (patched !== c) {
     `docker run -d --restart=unless-stopped --network=${DOCKER_NETWORK} --name ${containerName} -v ${imageName}-ipx-cache:/var/cache/ipx -e IPX_HTTP_ALLOW_ALL_DOMAINS=true ${imageName}`
   );
 
-  // 6. Prune dangling images from previous builds
+  // Prune dangling images from previous builds
   try { await run(`docker image prune -f`); } catch {}
 
-  // 7. Persist state
   await writeFile(
     join(workDir, "state.json"),
     JSON.stringify({ mode: "docker", imageName, containerName, publishDomain, customDomains }, null, 2) + "\n",
     "utf8"
   );
 
-  // 8. Register all hostnames → container name in the proxy (container:3000 on DOCKER_NETWORK)
+  // Register all hostnames → container name in the proxy (container:3000 on DOCKER_NETWORK)
   const allHostnames = [publishDomain, ...customDomains];
   for (const hostname of allHostnames) {
     dockerHostContainer.set(hostname, containerName);
