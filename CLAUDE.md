@@ -26,7 +26,7 @@ Une cible de publication = deux axes orthogonaux dans le body du `POST /publish`
 
 Le mapping request → pipeline vit dans `RENDER_HOSTS` / `normalizeTarget` / `availableTargets`
 (section « Publish target » de `server.mjs`). En interne, `state.json.mode` vaut
-`docker` (pour `ssr`), `cloudflare` ou `ssh` — un site SSG local n'écrit pas de `state.json`.
+`ssg` (local), `docker` (pour `ssr`), `cloudflare` ou `ssh`.
 
 **Champ `buildMode` hérité** — toujours accepté (CLI `webstudio` npm upstream, anciennes
 images builder). Mapping : `ssg` → `ssg`/`local`, `ssr` → `ssr`/`local`,
@@ -71,6 +71,7 @@ POST /publish { buildId, builderOrigin, buildMode: "ssg" }
   → réécriture des URLs absolues (.html et .xml) vers l'origine publique
   → cp dist/client → /var/publish/<domain>/ (+ une copie par custom domain,
     réécrite vers l'origine de ce domaine)
+  → state.json { mode: "ssg", publishDomain, customDomains }
 ```
 
 Les étapes `sync → build → vite build → réécriture URLs` sont extraites dans
@@ -171,11 +172,13 @@ Le serveur proxy sur port 4001 sert tous les sites publiés :
 
 ## Persistance de l'état (`state.json`)
 
-Un domaine servi par un runtime écrit `/var/work/<domain>/state.json` :
+Chaque domaine publié écrit `/var/work/<domain>/state.json` :
 ```json
 { "mode": "docker", "imageName": "ws-mysite", "containerName": "ws-mysite", "publishDomain": "mysite.wstd.work", "customDomains": [] }
 ```
-`mode` ∈ `docker` | `cloudflare` | `ssh`. Un site SSG local n'écrit pas de `state.json` (les fichiers sur disque suffisent).
+`mode` ∈ `ssg` | `docker` | `cloudflare` | `ssh`. C'est ce qui permet à la publication
+suivante de détecter le mode précédent et de nettoyer ce qu'il faut (un pipeline
+Docker/SSH purge les fichiers statiques d'un ancien SSG, etc.).
 
 Au démarrage, `restoreTargets()` relit tous les `state.json` : les containers Docker sont (re)démarrés, les routes de staging Cloudflare ré-enregistrées. SSG et SSH n'ont rien à restaurer.
 

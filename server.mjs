@@ -611,10 +611,10 @@ const publishBuildCloudflare = async ({ buildId }) => {
       await stopDockerForDomain(domain, prevState.containerName, prevState.publishDomain, prevState.customDomains ?? []);
       log(`Stopped Docker container for ${domain} (switching to Cloudflare)`);
     }
-  } catch { /* no state.json — new domain, or previously SSG */ }
+  } catch { /* no state.json — brand-new domain */ }
 
-  // SSG leaves no state.json, so clear static output unconditionally rather
-  // than on a detected transition.
+  // Clear any local static output (from a previous SSG publish) unconditionally
+  // — a stale copy under /var/publish would otherwise be served in parallel.
   for (const hostname of [publishDomain, ...customDomains]) {
     await rm(join(PUBLISH_DIR, hostname), { recursive: true, force: true });
   }
@@ -893,6 +893,15 @@ const publishBuild = async ({ buildId }) => {
     await transformOutputFiles(customDestDir, (html) => html.replaceAll(publicOrigin, `https://${customDomain}`));
     await writeTraefikRouteForDomain(customDomain);
   }
+
+  // 6. Persist state so the next publish can detect the transition away from SSG
+  // (a Docker / SSH pipeline purges these static files; without a state.json it
+  // has no way to know they exist). restoreTargets() has nothing to do for it.
+  await writeFile(
+    stateFile,
+    JSON.stringify({ mode: "ssg", publishDomain, customDomains }, null, 2) + "\n",
+    "utf8"
+  );
 
   log(`Successfully published ${domain}`);
 };
