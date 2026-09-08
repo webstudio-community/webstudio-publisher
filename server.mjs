@@ -16,7 +16,7 @@
  * builder images): ssg → ssg/local, ssr → ssr/local, cloudflare → ssg/cloudflare.
  * See RENDER_HOSTS / normalizeTarget below.
  *
- * SSR proxy (port PROXY_PORT, default 4001):
+ * Site proxy (port PROXY_PORT, default 4001):
  *   Serves all published sites — SSR domains are proxied to their Docker container,
  *   SSG domains are served directly from /var/publish/<domain>/, and the local staging
  *   domain of a cloudflare-mode site is reverse-proxied to <cfProjectName>.pages.dev.
@@ -27,13 +27,12 @@
  *   BUILDER_INTERNAL_URL   — internal Docker URL for the builder (default: http://app:3000)
  *   PORT                   — build API HTTP port (default: 4000)
  *   PROXY_PORT             — site proxy HTTP port (default: 4001)
- *   SSR_PORT_BASE          — base port for legacy SSR subprocesses (default: 5000)
  *   DOCKER_NETWORK         — Docker network shared with site containers (required for SSR mode)
  */
 
 import { createServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { exec, spawn } from "node:child_process";
+import { exec } from "node:child_process";
 import { createReadStream } from "node:fs";
 import { mkdir, cp, rm, access, readdir, readFile, writeFile, stat } from "node:fs/promises";
 import { join, extname } from "node:path";
@@ -44,7 +43,6 @@ const execAsync = promisify(exec);
 
 const PORT = process.env.PORT ?? "4000";
 const PROXY_PORT = process.env.PROXY_PORT ?? "4001";
-const SSR_PORT_BASE = parseInt(process.env.SSR_PORT_BASE ?? "5000");
 const SERVICE_TOKEN = process.env.TRPC_SERVER_API_TOKEN ?? "";
 const PUBLISHER_HOST = process.env.PUBLISHER_HOST ?? "";
 const CF_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN ?? "";
@@ -72,80 +70,11 @@ let OWN_CONTAINER_NAME = "";
 const log = (msg) => console.info(`[publisher] ${msg}`);
 const logErr = (msg) => console.error(`[publisher] ${msg}`);
 
-// ─── SSR process management ──────────────────────────────────────────────────
-
-// domain (project slug) → port number (persisted across restarts via state.json)
-const ssrDomainPort = new Map();
-// hostname (publishDomain or customDomain) → port number (for proxy routing)
-const ssrHostPort = new Map();
-// domain (project slug) → ChildProcess
-const ssrProcesses = new Map();
-// Next available port for a new SSR domain
-let nextSsrPort = SSR_PORT_BASE + 1;
-
-/**
- * Return the persistent port for an SSR domain, allocating a new one if needed.
- */
-const allocateSsrPort = (domain) => {
-  if (ssrDomainPort.has(domain)) return ssrDomainPort.get(domain);
-  const port = nextSsrPort++;
-  ssrDomainPort.set(domain, port);
-  return port;
-};
-
-/**
- * Start (or restart on republish) the react-router-serve process for an SSR site.
- * If a process is already running for this domain, it is killed first — the old
- * process keeps serving during the rebuild so there is no downtime.
- */
-const startSsrProcess = (domain, workDir, port) => {
-  const existing = ssrProcesses.get(domain);
-  if (existing) {
-    log(`Stopping previous SSR process for ${domain}`);
-    try { existing.kill("SIGTERM"); } catch {}
-    ssrProcesses.delete(domain);
-  }
-
-  const child = spawn(
-    "node",
-    ["node_modules/.bin/react-router-serve", "build/server/index.js"],
-    {
-      cwd: workDir,
-      env: { ...process.env, PORT: String(port) },
-      stdio: "pipe",
-    }
-  );
-
-  child.stdout.on("data", (d) => log(`[ssr:${domain}] ${d.toString().trim()}`));
-  child.stderr.on("data", (d) => logErr(`[ssr:${domain}] ${d.toString().trim()}`));
-  child.on("exit", (code, signal) => {
-    log(`[ssr:${domain}] process exited (code=${code}, signal=${signal})`);
-    ssrProcesses.delete(domain);
-  });
-
-  ssrProcesses.set(domain, child);
-  return child;
-};
-
-/**
- * Stop a running SSR process and remove its proxy routing entries.
- * Called when a domain is republished in SSG mode (mode switch).
- */
-const stopSsrForDomain = (domain, publishDomain, customDomains) => {
-  const proc = ssrProcesses.get(domain);
-  if (proc) {
-    log(`Stopping SSR process for ${domain} (switching to SSG)`);
-    try { proc.kill("SIGTERM"); } catch {}
-    ssrProcesses.delete(domain);
-  }
-  ssrHostPort.delete(publishDomain);
-  for (const cd of customDomains) ssrHostPort.delete(cd);
-  ssrDomainPort.delete(domain);
-};
+// ─── Docker container management ─────────────────────────────────────────────
 
 /**
  * Stop a running Docker container and remove its proxy routing entries.
- * Called on mode switches away from docker (→ ssg, → ssr, → cloudflare).
+ * Called on mode switches away from docker (→ ssg, → cloudflare, → ssh).
  */
 const stopDockerForDomain = async (domain, containerName, publishDomain, customDomains) => {
   log(`Stopping Docker container ${containerName} for ${domain}`);
@@ -156,10 +85,11 @@ const stopDockerForDomain = async (domain, containerName, publishDomain, customD
 };
 
 /**
- * On publisher startup, read state.json files and restore SSR processes and
- * Docker containers. Reconstructs ssrHostPort so the proxy routes correctly.
+ * On publisher startup, read state.json files and restore what each published
+ * site needs: Docker containers are started, Cloudflare staging routes are
+ * re-registered. SSG and SSH sites need nothing (files on disk / a remote host).
  */
-const restoreSsrProcesses = async () => {
+const restoreTargets = async () => {
   let entries;
   try {
     entries = await readdir(WORK_DIR, { withFileTypes: true });
@@ -174,25 +104,7 @@ const restoreSsrProcesses = async () => {
     try {
       const state = JSON.parse(await readFile(stateFile, "utf8"));
 
-      if (state.mode === "ssr") {
-        const { port, publishDomain, customDomains = [] } = state;
-        const workDir = join(WORK_DIR, domain);
-        const serverEntry = join(workDir, "build", "server", "index.js");
-
-        if (!(await pathExists(serverEntry))) {
-          log(`Skipping SSR restore for ${domain}: build/server/index.js not found`);
-          continue;
-        }
-
-        ssrDomainPort.set(domain, port);
-        if (port >= nextSsrPort) nextSsrPort = port + 1;
-        ssrHostPort.set(publishDomain, port);
-        for (const cd of customDomains) ssrHostPort.set(cd, port);
-
-        startSsrProcess(domain, workDir, port);
-        log(`Restored SSR process for ${domain} (port ${port})`);
-
-      } else if (state.mode === "docker") {
+      if (state.mode === "docker") {
         const { port, containerName, publishDomain, customDomains = [] } = state;
 
         // Ensure the container is running — restart it if stopped
@@ -655,10 +567,7 @@ const publishBuildCloudflare = async ({ buildId }) => {
   const stateFile = join(workDir, "state.json");
   try {
     const prevState = JSON.parse(await readFile(stateFile, "utf8"));
-    if (prevState.mode === "ssr") {
-      stopSsrForDomain(domain, prevState.publishDomain, prevState.customDomains ?? []);
-      log(`Stopped SSR process for ${domain} (switching to Cloudflare)`);
-    } else if (prevState.mode === "docker") {
+    if (prevState.mode === "docker") {
       await stopDockerForDomain(domain, prevState.containerName, prevState.publishDomain, prevState.customDomains ?? []);
       log(`Stopped Docker container for ${domain} (switching to Cloudflare)`);
     }
@@ -775,10 +684,7 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
   const stateFile = join(workDir, "state.json");
   try {
     const prevState = JSON.parse(await readFile(stateFile, "utf8"));
-    if (prevState.mode === "ssr") {
-      stopSsrForDomain(domain, prevState.publishDomain, prevState.customDomains ?? []);
-      await rm(stateFile, { force: true });
-    } else if (prevState.mode === "docker") {
+    if (prevState.mode === "docker") {
       await stopDockerForDomain(domain, prevState.containerName, prevState.publishDomain, prevState.customDomains ?? []);
       await rm(stateFile, { force: true });
     } else if (prevState.mode === "cloudflare") {
@@ -982,7 +888,7 @@ const toDockerName = (domain) =>
  *   4. docker build -t <image> .   ← built ONCE, reused for all hostnames
  *   5. docker stop/rm old container + docker run new one
  *   6. docker image prune -f
- *   7. Persist state.json + register all hostnames in ssrHostPort (proxy reuse)
+ *   7. Persist state.json + register all hostnames in dockerHostContainer (proxy)
  */
 const publishBuildSsr = async ({ buildId }) => {
   log(`Starting Docker publish for build ${buildId}`);
@@ -1022,9 +928,6 @@ const publishBuildSsr = async ({ buildId }) => {
         await rm(join(PUBLISH_DIR, h), { recursive: true, force: true });
       }
       log(`Removed stale SSG output for ${domain}`);
-    } else if (prevState.mode === "ssr") {
-      stopSsrForDomain(domain, prevState.publishDomain, prevState.customDomains ?? []);
-      log(`Stopped SSR process for ${domain} (switching to Docker)`);
     } else if (prevState.mode === "cloudflare") {
       // Same as the SSG path: the Pages project is the user's to delete. The
       // staging domain moves to this Docker container instead, so drop its
@@ -1139,8 +1042,9 @@ if (patched !== c) {
 
 /**
  * Unified HTTP proxy that serves all published Webstudio sites:
- *   - SSR domains  → reverse-proxied to their react-router-serve subprocess
- *   - SSG domains  → served directly from /var/publish/<host>/
+ *   - SSR domains       → reverse-proxied to their Docker container (:3000)
+ *   - Cloudflare domains → the staging hostname is proxied to <project>.pages.dev
+ *   - SSG domains       → served directly from /var/publish/<host>/
  *
  * The self-host stack should route *.PUBLISHER_HOST traffic here (PROXY_PORT).
  */
@@ -1168,33 +1072,6 @@ const proxyServer = createServer(async (req, res) => {
       if (!res.headersSent) {
         res.writeHead(502);
         res.end("Docker proxy error");
-      }
-    });
-    req.pipe(proxyReq, { end: true });
-    return;
-  }
-
-  // Legacy SSR subprocess: proxy to react-router-serve on 127.0.0.1
-  const ssrPort = ssrHostPort.get(host);
-  if (ssrPort !== undefined) {
-    const proxyReq = httpRequest(
-      {
-        hostname: "127.0.0.1",
-        port: ssrPort,
-        path: req.url,
-        method: req.method,
-        headers: { ...req.headers, host },
-      },
-      (proxyRes) => {
-        res.writeHead(proxyRes.statusCode, proxyRes.headers);
-        proxyRes.pipe(res, { end: true });
-      }
-    );
-    proxyReq.on("error", (err) => {
-      logErr(`SSR proxy error for ${host}: ${err.message}`);
-      if (!res.headersSent) {
-        res.writeHead(502);
-        res.end("SSR proxy error");
       }
     });
     req.pipe(proxyReq, { end: true });
@@ -1250,12 +1127,11 @@ const removeTraefikRouteForDomain = async (domain) => {
 /**
  * Drop a single hostname from a site that still has other hostnames.
  * state.json is rewritten to list exactly the hostnames that remain live, so a
- * later restoreSsrProcesses() does not re-register the removed one.
+ * later restoreTargets() does not re-register the removed one.
  */
 const removeHostname = async (stateFile, state, hostname, remaining) => {
   log(`Removing hostname ${hostname} (site keeps ${remaining.join(", ")})`);
   dockerHostContainer.delete(hostname);
-  ssrHostPort.delete(hostname);
   await rm(join(PUBLISH_DIR, hostname), { recursive: true, force: true });
   await removeTraefikRouteForDomain(hostname);
   const [publishDomain, ...customDomains] = remaining;
@@ -1282,8 +1158,6 @@ const teardownSite = async (domain, state) => {
       try { await execAsync(`docker rmi ${imageName}`); } catch {}
       try { await execAsync(`docker volume rm ${imageName}-ipx-cache`); } catch {}
     }
-  } else if (mode === "ssr") {
-    stopSsrForDomain(domain, publishDomain, customDomains);
   } else if (mode === "cloudflare") {
     // Deleting someone's Cloudflare Pages project is a destructive call into
     // their account with different semantics from the local modes, so it is
@@ -1293,12 +1167,11 @@ const teardownSite = async (domain, state) => {
 
   for (const hostname of hostnames) {
     dockerHostContainer.delete(hostname);
-    ssrHostPort.delete(hostname);
     await rm(join(PUBLISH_DIR, hostname), { recursive: true, force: true });
     await removeTraefikRouteForDomain(hostname);
   }
 
-  // Last: while state.json exists, restoreSsrProcesses() restarts the site on
+  // Last: while state.json exists, restoreTargets() restarts the site on
   // the next publisher boot, so removing it is what makes the teardown stick.
   await rm(join(WORK_DIR, domain), { recursive: true, force: true });
   log(`Tore down ${domain}`);
@@ -1567,10 +1440,10 @@ try {
   logErr("Warning: could not resolve own container name — Traefik configs will use IP (may break on container restart).");
 }
 
-await restoreSsrProcesses();
+await restoreTargets();
 
 proxyServer.listen(PROXY_PORT, () => {
-  log(`Site proxy listening on port ${PROXY_PORT} (SSR + SSG)`);
+  log(`Site proxy listening on port ${PROXY_PORT}`);
 });
 
 server.listen(PORT, () => {

@@ -25,8 +25,8 @@ Une cible de publication = deux axes orthogonaux dans le body du `POST /publish`
 | `ssg` | `coolify` | app Coolify distante (nginx) | 🔜 `501` — self-host#24 |
 
 Le mapping request → pipeline vit dans `RENDER_HOSTS` / `normalizeTarget` / `availableTargets`
-(section « Publish target » de `server.mjs`). Les corps de pipeline et le champ interne
-`state.json.mode` (`ssg` / `docker` / `ssr` / `cloudflare`) sont inchangés.
+(section « Publish target » de `server.mjs`). En interne, `state.json.mode` vaut
+`docker` (pour `ssr`) ou `cloudflare` — un site SSG local n'écrit pas de `state.json`.
 
 **Champ `buildMode` hérité** — toujours accepté (CLI `webstudio` npm upstream, anciennes
 images builder). Mapping : `ssg` → `ssg`/`local`, `ssr` → `ssr`/`local`,
@@ -45,8 +45,8 @@ POST /publish { buildId, builderOrigin, buildMode: "ssr" }
   → DOCKER_BUILDKIT=1 docker build -t <ws-domain> .   ← une seule fois
   → docker stop/rm <container> ; docker run -p PORT:3000 -d --restart=unless-stopped
   → docker image prune -f
-  → state.json { mode: "docker", port, imageName, containerName, publishDomain, customDomains }
-  → tous les hostnames (publishDomain + customDomains) enregistrés dans ssrHostPort
+  → state.json { mode: "docker", imageName, containerName, publishDomain, customDomains }
+  → tous les hostnames (publishDomain + customDomains) enregistrés dans dockerHostContainer
 ```
 
 **Infra requise** : monter `/var/run/docker.sock` dans le container publisher.
@@ -73,26 +73,11 @@ POST /publish { buildId, builderOrigin, buildMode: "ssg" }
     réécrite vers l'origine de ce domaine)
 ```
 
-### `ssr` — Node SSR local
-
-```
-POST /publish { buildId, builderOrigin, buildMode: "ssr" }
-  → webstudio sync --buildId --origin --authToken
-  → webstudio build --template docker
-  → npm install (si node_modules absent, ou si switch depuis SSG)
-  → npm run build  (react-router build → build/server/index.js)
-  → react-router-serve ./build/server/index.js sur port dynamique (5001+)
-  → état persisté dans /var/work/<domain>/state.json
-```
-
-Le subprocess SSR est accessible via le proxy sur `PROXY_PORT` (défaut 4001).
-La stack self-host doit router `*.PUBLISHER_HOST` vers ce port (voir `webstudio-self-host`).
-
 ### `cloudflare` — Cloudflare Pages
 
 ```
 POST /publish { buildId, builderOrigin, buildMode: "cloudflare" }
-  → arrêt du mode précédent (container docker / process ssr) + purge de /var/publish/<hostname>
+  → arrêt du mode précédent (container docker) + purge de /var/publish/<hostname>
   → webstudio sync --buildId --origin --authToken
   → webstudio build --template cloudflare
   → npm install (si node_modules absent OU appartient à un autre template)
@@ -147,19 +132,19 @@ Les jobs sont sérialisés **par domaine** via une queue de promesses (`projectQ
 ## Proxy de sites (port PROXY_PORT)
 
 Le serveur proxy sur port 4001 sert tous les sites publiés :
-- **SSR** : reverse-proxy vers le subprocess `react-router-serve` du domaine
+- **SSR** (`mode: "docker"`) : reverse-proxy vers le container Docker du domaine (`<container>:3000` sur `DOCKER_NETWORK`)
+- **Cloudflare** (`mode: "cloudflare"`) : le hostname de staging est reverse-proxié vers `<project>.pages.dev`
 - **SSG** : fichiers statiques servis directement depuis `/var/publish/<host>/`
 
-## Persistance SSR
+## Persistance de l'état (`state.json`)
 
-Chaque domaine SSR écrit `/var/work/<domain>/state.json` :
+Un domaine servi par un runtime écrit `/var/work/<domain>/state.json` :
 ```json
-{ "mode": "ssr", "port": 5001, "publishDomain": "mysite.wstd.work", "customDomains": [] }
+{ "mode": "docker", "imageName": "ws-mysite", "containerName": "ws-mysite", "publishDomain": "mysite.wstd.work", "customDomains": [] }
 ```
+`mode` ∈ `docker` | `cloudflare`. Un site SSG local n'écrit pas de `state.json` (les fichiers sur disque suffisent).
 
-Au démarrage du publisher, `restoreSsrProcesses()` relit tous les `state.json` et relance les subprocesses SSR.
-
-Les ports sont alloués dynamiquement à partir de `SSR_PORT_BASE + 1` (défaut: 5001) et persistés dans `state.json` pour rester stables entre redémarrages.
+Au démarrage, `restoreTargets()` relit tous les `state.json` : les containers Docker sont (re)démarrés, les routes de staging Cloudflare ré-enregistrées. SSG n'a rien à restaurer.
 
 ## Variables d'environnement
 
@@ -171,8 +156,6 @@ Les ports sont alloués dynamiquement à partir de `SSR_PORT_BASE + 1` (défaut:
 | `TRAEFIK_DYNAMIC_DIR` | Si défini, écrit les configs Traefik pour les domaines custom |
 | `PORT` | Port de l'API build (défaut: 4000) |
 | `PROXY_PORT` | Port du proxy de sites (défaut: 4001) |
-| `SSR_PORT_BASE` | Base des ports subprocess SSR (défaut: 5000 → premiers sites sur 5001, 5002…) |
-| `DOCKER_PORT_BASE` | Base des ports containers Docker (défaut: 6000 → premiers sites sur 6001, 6002…) |
 | `CLOUDFLARE_API_TOKEN` | Token Wrangler pour deploy CF Pages (mode `cloudflare`) |
 | `CLOUDFLARE_ACCOUNT_ID` | ID compte Cloudflare (mode `cloudflare`) |
 | `CLOUDFLARE_PRODUCTION_BRANCH` | Branche de production des projets Pages créés (défaut: `main`) |
@@ -185,7 +168,7 @@ Les ports sont alloués dynamiquement à partir de `SSR_PORT_BASE + 1` (défaut:
 - Les custom domains (contenant un `.`) reçoivent une config Traefik auto-générée pour Let's Encrypt
 - Le nom de projet CF Pages est dérivé du domain (sanitisé en `[a-z0-9-]+`, max 58 chars)
 - Transition SSG→SSR : les `node_modules` sont forcément réinstallés (templates incompatibles)
-- Transition SSR→SSG : le subprocess SSR est stoppé proprement avant le build SSG
+- Transition SSR→SSG : le container Docker est stoppé/supprimé proprement avant le build SSG
 
 ## Docker
 
