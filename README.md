@@ -31,6 +31,8 @@ for the full Docker Compose setup.
 | `BUILDER_INTERNAL_URL` | `http://app:3000` | Internal Docker URL for the builder (avoids Traefik/TLS) |
 | `PUBLISHER_HOST` | — | Domain suffix for slug-based URLs (e.g. `example.com` → `myproject.example.com`) |
 | `PORT` | `4000` | HTTP port |
+| `REGISTRY_URL` | — | Registry to push SSR images to for `host: "coolify"` (e.g. `ghcr.io/my-org`) — enables the `ssr:coolify` target |
+| `REGISTRY_USER` / `REGISTRY_TOKEN` | — | Registry write credentials (if private) |
 
 ## Building locally
 
@@ -42,7 +44,7 @@ docker build -t webstudio-publisher .
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/publish` | Trigger a publish. Body: `{ "buildId", "builderOrigin", "renderMode": "ssg" \| "ssr", "host": "local" \| "cloudflare" \| "ssh" }` (legacy `"buildMode": "ssg" \| "ssr" \| "cloudflare"` still accepted) |
+| `POST` | `/publish` | Trigger a publish. Body: `{ "buildId", "builderOrigin", "renderMode": "ssg" \| "ssr", "host": "local" \| "cloudflare" \| "ssh" \| "coolify" }` (+ `coolifyWebhookUrl` / `coolifyWebhookToken?` for `host: "coolify"`; legacy `"buildMode"` still accepted) |
 | `POST` | `/targets/ssh-setup` | Configure the SSH target for a domain (`host: "ssh"`). Body: `{ "domain", "sshHost", "sshUser", "sshPath", "sshPort"?, "sshPrivateKey", "publicUrl"? }` |
 | `POST` | `/unpublish` | Take a hostname down. Body: `{ "domain": "..." }` |
 | `GET` | `/capabilities` | Publisher capabilities — `{ "cloudflare": bool, "coolify": bool, "ssh": bool, "targets": ["ssg:local", …] }` |
@@ -66,3 +68,17 @@ curl -X POST http://publisher:4000/targets/ssh-setup \
 Each publish runs `rsync -az --delete` from the freshly built `dist/client/` to
 `sshUser@sshHost:sshPath/`. TLS and web-server config on the remote host are the
 user's responsibility; the publisher does not serve the site or manage its domain.
+
+### `host: "coolify"` — deploy an SSR site to a remote Coolify
+
+Set `REGISTRY_URL` (+ `REGISTRY_USER` / `REGISTRY_TOKEN` if private) on the
+publisher. On the target Coolify, the site owner creates a **Docker Image**
+application pulling `${REGISTRY_URL}/ws-<project-slug>` (port `3000`), and copies
+its **deploy webhook URL**.
+
+Each publish then: `docker build` the SSR image → push
+`${REGISTRY_URL}/ws-<slug>:latest` (+ `:<buildId>`) → `POST` the webhook (with a
+`Bearer` token if given) so Coolify pulls the new image and redeploys. The
+publisher never talks to the Coolify API directly and never polls — a `2xx` from
+the webhook means the deploy is queued. `unpublish` forgets the site locally; the
+Coolify app and the registry images are left in place.

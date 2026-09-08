@@ -21,12 +21,12 @@ Une cible de publication = deux axes orthogonaux dans le body du `POST /publish`
 | `ssr` | `local` | `publishBuildSsr` — `docker build` + `docker run` par domaine | ✅ |
 | `ssg` | `cloudflare` | `publishBuildCloudflare` — `wrangler pages deploy` | ✅ (si `CLOUDFLARE_*`) |
 | `ssg` | `ssh` | `publishBuildSsh` — `rsync` de l'output SSG vers un serveur distant | ✅ (cible par domaine via `POST /targets/ssh-setup`) |
-| `ssr` | `coolify` | app Coolify distante | 🔜 `501` — self-host#23 |
+| `ssr` | `coolify` | `publishBuildCoolifySsr` — image SSR → `REGISTRY_URL` → deploy webhook Coolify | ✅ (si `REGISTRY_URL` ; webhook par publish) |
 | `ssg` | `coolify` | app Coolify distante (nginx) | 🔜 `501` — self-host#24 |
 
 Le mapping request → pipeline vit dans `RENDER_HOSTS` / `normalizeTarget` / `availableTargets`
 (section « Publish target » de `server.mjs`). En interne, `state.json.mode` vaut
-`ssg` (local), `docker` (pour `ssr`), `cloudflare` ou `ssh`.
+`ssg` (local), `docker` (pour `ssr` local), `cloudflare`, `ssh` ou `coolify`.
 
 **Champ `buildMode` hérité** — toujours accepté (CLI `webstudio` npm upstream, anciennes
 images builder). Mapping : `ssg` → `ssg`/`local`, `ssr` → `ssr`/`local`,
@@ -107,6 +107,37 @@ oublie le site localement ; les fichiers distants sont laissés en place.
 Image : `rsync` + `openssh-client` (+ `curl` + `jq` pour appeler l'API depuis
 `docker compose exec`) ajoutés au `Dockerfile`.
 
+### `ssr` + `coolify` — SSR sur un Coolify distant
+
+Le publisher ne possède aucun identifiant Coolify. Chaque site est hébergé sur
+**le Coolify de son propriétaire**, potentiellement un serveur différent.
+
+Config **instance-wide** (`.env` publisher) : `REGISTRY_URL` (+ `REGISTRY_USER` /
+`REGISTRY_TOKEN` si privé) — le registre où le publisher **pousse** l'image, et
+d'où le Coolify du client **pull**.
+
+Config **par site** : le `deployWebhookUrl` (+ token optionnel) de l'app Coolify,
+envoyé dans le body du `POST /publish` (`coolifyWebhookUrl` / `coolifyWebhookToken`).
+
+```
+POST /publish { buildId, renderMode: "ssr", host: "coolify", coolifyWebhookUrl, coolifyWebhookToken? }
+  → arrêt de ce qui servait le site localement + purge /var/publish + Traefik
+  → buildDockerImage()  tag = $REGISTRY_URL/ws-<slug>:latest  (+ :<buildId>)
+  → docker login $REGISTRY_URL (si REGISTRY_USER, token via env, jamais loggé)
+  → docker push :latest + :<buildId>
+  → POST coolifyWebhookUrl (Bearer token) → Coolify pull :latest et redéploie
+  → state.json { mode: "coolify", imageRepo, webhookUrl, publishDomain, customDomains }
+```
+
+Le publisher **ne parle jamais à l'API Coolify** autrement que via ce webhook, ne
+sert pas le site, n'écrit pas de Traefik, et **ne poll pas** (un 2xx du webhook =
+« déploiement en file »). `unpublish` oublie le site localement ; l'app Coolify et
+les images du registre sont laissées en place (elles appartiennent au client).
+`isSafeWebhookUrl` rejette le non-https et les hôtes loopback/privés (anti-SSRF).
+
+`ENV IPX_HTTP_ALLOW_ALL_DOMAINS=true` + `EXPOSE 3000` sont dans le `DOCKER_SITE_DOCKERFILE`
+→ l'app Coolify du client n'a qu'à pointer sur l'image (port 3000).
+
 ### `cloudflare` — Cloudflare Pages
 
 ```
@@ -176,11 +207,12 @@ Chaque domaine publié écrit `/var/work/<domain>/state.json` :
 ```json
 { "mode": "docker", "imageName": "ws-mysite", "containerName": "ws-mysite", "publishDomain": "mysite.wstd.work", "customDomains": [] }
 ```
-`mode` ∈ `ssg` | `docker` | `cloudflare` | `ssh`. C'est ce qui permet à la publication
-suivante de détecter le mode précédent et de nettoyer ce qu'il faut (un pipeline
-Docker/SSH purge les fichiers statiques d'un ancien SSG, etc.).
+`mode` ∈ `ssg` | `docker` | `cloudflare` | `ssh` | `coolify`. C'est ce qui permet à
+la publication suivante de détecter le mode précédent et de nettoyer ce qu'il faut
+(un pipeline distant purge les fichiers statiques + container + Traefik d'un ancien
+mode local, etc.).
 
-Au démarrage, `restoreTargets()` relit tous les `state.json` : les containers Docker sont (re)démarrés, les routes de staging Cloudflare ré-enregistrées. SSG et SSH n'ont rien à restaurer.
+Au démarrage, `restoreTargets()` relit tous les `state.json` : les containers Docker sont (re)démarrés, les routes de staging Cloudflare ré-enregistrées. SSG / SSH / Coolify n'ont rien à restaurer (fichiers sur disque, ou site hébergé ailleurs).
 
 ## Variables d'environnement
 
@@ -195,6 +227,8 @@ Au démarrage, `restoreTargets()` relit tous les `state.json` : les containers D
 | `CLOUDFLARE_API_TOKEN` | Token Wrangler pour deploy CF Pages (mode `cloudflare`) |
 | `CLOUDFLARE_ACCOUNT_ID` | ID compte Cloudflare (mode `cloudflare`) |
 | `CLOUDFLARE_PRODUCTION_BRANCH` | Branche de production des projets Pages créés (défaut: `main`) |
+| `REGISTRY_URL` | Registre où pousser les images SSR pour `host: coolify` (ex: `ghcr.io/my-org`) — active la cible `ssr:coolify` |
+| `REGISTRY_USER` / `REGISTRY_TOKEN` | Identifiants d'écriture du registre (si privé) |
 
 ## Points d'attention
 

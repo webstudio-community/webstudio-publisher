@@ -12,7 +12,9 @@
  *   host       — "local" (served by this publisher) | "cloudflare" (wrangler
  *                pages deploy) | "ssh" (SSG output rsync'd to a remote server,
  *                target set once per domain via POST /targets/ssh-setup)
- *                | "coolify"   (coolify: planned, 501)
+ *                | "coolify" (SSR image pushed to REGISTRY_URL, then the site's
+ *                deploy webhook — passed per publish — is POSTed so a remote
+ *                Coolify pulls and redeploys)
  *
  * The legacy `buildMode` field is still accepted (upstream `webstudio` CLI, older
  * builder images): ssg → ssg/local, ssr → ssr/local, cloudflare → ssg/cloudflare.
@@ -53,6 +55,12 @@ const CF_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID ?? "";
 // name matters — there is no git repository behind it — but creating and
 // deploying have to agree, or the deployment is filed as a preview.
 const CF_PRODUCTION_BRANCH = process.env.CLOUDFLARE_PRODUCTION_BRANCH ?? "main";
+// Container registry the publisher pushes SSR images to for the `coolify` host —
+// a remote Coolify pulls them from here. Only needed for host: "coolify".
+// e.g. "ghcr.io/my-org" (public images → no creds), or your own registry:2.
+const REGISTRY_URL = process.env.REGISTRY_URL ?? "";
+const REGISTRY_USER = process.env.REGISTRY_USER ?? "";
+const REGISTRY_TOKEN = process.env.REGISTRY_TOKEN ?? "";
 // URL interne Docker pour joindre le builder sans passer par Traefik/TLS
 const BUILDER_INTERNAL_URL = process.env.BUILDER_INTERNAL_URL ?? "http://app:3000";
 const PUBLISH_DIR = "/var/publish";
@@ -471,6 +479,10 @@ COPY package.json /app/
 COPY --from=dependencies-env /app/node_modules /app/node_modules
 COPY --from=build-env /app/build /app/build
 WORKDIR /app
+# ipx serves optimized images for any host — baked in so a Coolify-hosted app
+# needs no manual env var (the local SSR pipeline also passes it via -e).
+ENV IPX_HTTP_ALLOW_ALL_DOMAINS=true
+EXPOSE 3000
 CMD ["npm", "run", "start"]
 `;
 
@@ -1028,31 +1040,20 @@ const toDockerName = (domain) =>
     .replace(/^-+|-+$/g, "");
 
 /**
- * Publish an SSR site as an isolated Docker container.
+ * Sync the build, generate the react-router-docker project, and produce a
+ * Docker image tagged `imageTag` in the local daemon. Shared by the local SSR
+ * pipeline (publishBuildSsr → `docker run`) and the remote Coolify pipeline
+ * (publishBuildCoolifySsr → `docker push` to a registry).
  *
  * Workflow:
  *   1. webstudio sync
  *   2. webstudio build --template docker
- *   3. Write DOCKER_SITE_DOCKERFILE into workDir
- *   4. docker build -t <image> .   ← built ONCE, reused for all hostnames
- *   5. docker stop/rm old container + docker run new one
- *   6. docker image prune -f
- *   7. Persist state.json + register all hostnames in dockerHostContainer (proxy)
+ *   2b. patch [_image].$.ts (ipx storage + disk cache)
+ *   2c. write patch-navlink.cjs (run inside the build)
+ *   3. write DOCKER_SITE_DOCKERFILE
+ *   4. docker build -t <imageTag> .
  */
-const publishBuildSsr = async ({ buildId }) => {
-  log(`Starting Docker publish for build ${buildId}`);
-
-  const { projectDomain: domain, customDomains } = await getProjectBuildInfo(buildId);
-  log(`Project domain: ${domain}`);
-  if (customDomains.length > 0) {
-    log(`Custom domains: ${customDomains.join(", ")}`);
-  }
-
-  const publishDomain = qualifyPublishDomain(domain);
-
-  const workDir = join(WORK_DIR, domain);
-  await mkdir(workDir, { recursive: true });
-
+const buildDockerImage = async ({ buildId, domain, workDir, imageTag }) => {
   const run = async (cmd, extraEnv = {}) => {
     log(`  $ ${cmd}`);
     const { stdout, stderr } = await execAsync(cmd, {
@@ -1063,26 +1064,6 @@ const publishBuildSsr = async ({ buildId }) => {
     if (stdout) log(`  stdout: ${stdout.trim()}`);
     if (stderr) log(`  stderr: ${stderr.trim()}`);
   };
-
-  // Handle mode transitions → docker
-  const stateFile = join(workDir, "state.json");
-  try {
-    const prevState = JSON.parse(await readFile(stateFile, "utf8"));
-    if (prevState.mode === "ssg") {
-      // Remove stale static files so the proxy stops serving them directly
-      for (const h of [prevState.publishDomain ?? publishDomain, ...(prevState.customDomains ?? [])]) {
-        await rm(join(PUBLISH_DIR, h), { recursive: true, force: true });
-      }
-      log(`Removed stale SSG output for ${domain}`);
-    } else if (prevState.mode === "cloudflare") {
-      // Same as the SSG path: the Pages project is the user's to delete. The
-      // staging domain moves to this Docker container instead, so drop its
-      // reverse-proxy route or it would keep going to Cloudflare.
-      cfProjectHost.delete(prevState.publishDomain);
-      log(`${domain} was on Cloudflare Pages — project "${prevState.cfProjectName}" left in place and still live`);
-    }
-    // mode: "docker" → old container is stopped in step 6 below
-  } catch { /* no state.json — new domain */ }
 
   // 1. Sync build data
   log(`Syncing build data for ${domain}...`);
@@ -1150,12 +1131,66 @@ if (patched !== c) {
   await writeFile(join(workDir, "Dockerfile"), DOCKER_SITE_DOCKERFILE, "utf8");
   log(`Wrote Dockerfile for ${domain}`);
 
-  // 4. Build image once — shared across all hostnames (@m8jj skip-build pattern)
-  const imageName = toDockerName(domain);
-  log(`Building Docker image ${imageName}...`);
-  await run(`docker build -t ${imageName} .`, { DOCKER_BUILDKIT: "1" });
+  // 4. Build the image
+  log(`Building Docker image ${imageTag}...`);
+  await run(`docker build -t ${imageTag} .`, { DOCKER_BUILDKIT: "1" });
+};
 
-  // 5. Stop/remove old container + start fresh one on the shared Docker network
+/**
+ * Publish an SSR site as an isolated Docker container on this host.
+ *
+ * buildDockerImage() → docker stop/rm + docker run → prune → state.json +
+ * register every hostname in dockerHostContainer (the proxy reverses to
+ * <container>:3000 on DOCKER_NETWORK).
+ */
+const publishBuildSsr = async ({ buildId }) => {
+  log(`Starting Docker publish for build ${buildId}`);
+
+  const { projectDomain: domain, customDomains } = await getProjectBuildInfo(buildId);
+  log(`Project domain: ${domain}`);
+  if (customDomains.length > 0) {
+    log(`Custom domains: ${customDomains.join(", ")}`);
+  }
+
+  const publishDomain = qualifyPublishDomain(domain);
+  const workDir = join(WORK_DIR, domain);
+  await mkdir(workDir, { recursive: true });
+
+  const run = async (cmd, extraEnv = {}) => {
+    log(`  $ ${cmd}`);
+    const { stdout, stderr } = await execAsync(cmd, {
+      cwd: workDir,
+      maxBuffer: 10 * 1024 * 1024,
+      env: { ...process.env, ...extraEnv },
+    });
+    if (stdout) log(`  stdout: ${stdout.trim()}`);
+    if (stderr) log(`  stderr: ${stderr.trim()}`);
+  };
+
+  // Handle mode transitions → docker
+  const stateFile = join(workDir, "state.json");
+  try {
+    const prevState = JSON.parse(await readFile(stateFile, "utf8"));
+    if (prevState.mode === "ssg") {
+      // Remove stale static files so the proxy stops serving them directly
+      for (const h of [prevState.publishDomain ?? publishDomain, ...(prevState.customDomains ?? [])]) {
+        await rm(join(PUBLISH_DIR, h), { recursive: true, force: true });
+      }
+      log(`Removed stale SSG output for ${domain}`);
+    } else if (prevState.mode === "cloudflare") {
+      // Same as the SSG path: the Pages project is the user's to delete. The
+      // staging domain moves to this Docker container instead, so drop its
+      // reverse-proxy route or it would keep going to Cloudflare.
+      cfProjectHost.delete(prevState.publishDomain);
+      log(`${domain} was on Cloudflare Pages — project "${prevState.cfProjectName}" left in place and still live`);
+    }
+    // mode: "docker" → old container is stopped below
+  } catch { /* no state.json — new domain */ }
+
+  const imageName = toDockerName(domain);
+  await buildDockerImage({ buildId, domain, workDir, imageTag: imageName });
+
+  // Stop/remove old container + start fresh one on the shared Docker network
   const containerName = imageName;
   log(`Deploying container ${containerName}...`);
   try { await run(`docker stop ${containerName}`); } catch {}
@@ -1164,17 +1199,16 @@ if (patched !== c) {
     `docker run -d --restart=unless-stopped --network=${DOCKER_NETWORK} --name ${containerName} -v ${imageName}-ipx-cache:/var/cache/ipx -e IPX_HTTP_ALLOW_ALL_DOMAINS=true ${imageName}`
   );
 
-  // 6. Prune dangling images from previous builds
+  // Prune dangling images from previous builds
   try { await run(`docker image prune -f`); } catch {}
 
-  // 7. Persist state
   await writeFile(
     join(workDir, "state.json"),
     JSON.stringify({ mode: "docker", imageName, containerName, publishDomain, customDomains }, null, 2) + "\n",
     "utf8"
   );
 
-  // 8. Register all hostnames → container name in the proxy (container:3000 on DOCKER_NETWORK)
+  // Register all hostnames → container name in the proxy (container:3000 on DOCKER_NETWORK)
   const allHostnames = [publishDomain, ...customDomains];
   for (const hostname of allHostnames) {
     dockerHostContainer.set(hostname, containerName);
@@ -1182,6 +1216,164 @@ if (patched !== c) {
   }
 
   log(`Successfully published Docker site ${domain} (container ${containerName})`);
+};
+
+// ─── Remote Coolify pipeline (SSR image → registry → deploy webhook) ─────────
+
+/**
+ * Reject a deploy webhook URL that isn't https or points at a loopback /
+ * link-local / private address — the publisher POSTs to it from inside the
+ * compose network, so an internal URL would be an SSRF foothold.
+ */
+const isSafeWebhookUrl = (value) => {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "https:") {
+    return false;
+  }
+  const host = url.hostname;
+  return (
+    host !== "localhost" &&
+    /^127\./.test(host) === false &&
+    /^169\.254\./.test(host) === false &&
+    /^10\./.test(host) === false &&
+    /^192\.168\./.test(host) === false &&
+    /^172\.(1[6-9]|2\d|3[01])\./.test(host) === false &&
+    host !== "0.0.0.0" &&
+    host !== "::1"
+  );
+};
+
+/**
+ * Publish an SSR site to a remote Coolify instance.
+ *
+ * The publisher owns no Coolify credentials: the site's owner creates a
+ * "Docker Image" app on their Coolify pointing at `${REGISTRY_URL}/ws-<slug>`
+ * and gives us its deploy webhook URL (per-site, in the publish request).
+ *
+ * Workflow:
+ *   1. tear down whatever was serving this site locally
+ *   2. buildDockerImage() tagged `${REGISTRY_URL}/ws-<slug>:latest` (+ :<buildId>)
+ *   3. docker login (if REGISTRY_USER) + docker push both tags
+ *   4. POST the deploy webhook → Coolify pulls the new image and redeploys
+ *   5. state.json { mode: "coolify", imageRepo, webhookUrl }
+ *
+ * The publisher does not serve the site, writes no Traefik config, and never
+ * polls Coolify — the webhook returning 2xx means "deploy queued".
+ */
+const publishBuildCoolifySsr = async ({
+  buildId,
+  coolifyWebhookUrl,
+  coolifyWebhookToken,
+}) => {
+  log(`Starting Coolify SSR publish for build ${buildId}`);
+
+  if (!REGISTRY_URL) {
+    throw new Error(
+      "REGISTRY_URL is not set on the publisher — required for host: coolify. " +
+        "Point it at a registry your Coolify can pull from (e.g. ghcr.io/my-org)."
+    );
+  }
+  if (!coolifyWebhookUrl) {
+    throw new Error(
+      "No Coolify deploy webhook configured for this site. Paste the app's " +
+        "deploy webhook URL in the Publish panel."
+    );
+  }
+  if (isSafeWebhookUrl(coolifyWebhookUrl) === false) {
+    throw new Error(
+      `Invalid Coolify webhook URL "${coolifyWebhookUrl}" — must be an https URL to a public host.`
+    );
+  }
+
+  const { projectDomain: domain, customDomains } = await getProjectBuildInfo(buildId);
+  log(`Project domain: ${domain}`);
+
+  const publishDomain = qualifyPublishDomain(domain);
+  const workDir = join(WORK_DIR, domain);
+  await mkdir(workDir, { recursive: true });
+
+  const run = async (cmd, extraEnv = {}) => {
+    log(`  $ ${cmd}`);
+    const { stdout, stderr } = await execAsync(cmd, {
+      cwd: workDir,
+      maxBuffer: 10 * 1024 * 1024,
+      env: { ...process.env, ...extraEnv },
+    });
+    if (stdout) log(`  stdout: ${stdout.trim()}`);
+    if (stderr) log(`  stderr: ${stderr.trim()}`);
+  };
+
+  // Handle mode transitions → coolify. The site moves to a remote Coolify, so
+  // stop serving it here.
+  const stateFile = join(workDir, "state.json");
+  let prevState;
+  try {
+    prevState = JSON.parse(await readFile(stateFile, "utf8"));
+  } catch { /* no state.json — new domain */ }
+  if (prevState?.mode === "docker") {
+    await stopDockerForDomain(domain, prevState.containerName, prevState.publishDomain, prevState.customDomains ?? []);
+  } else if (prevState?.mode === "cloudflare") {
+    cfProjectHost.delete(prevState.publishDomain);
+    log(`${domain} was on Cloudflare Pages — project "${prevState.cfProjectName}" left in place and still live`);
+  }
+  for (const hostname of [publishDomain, ...customDomains]) {
+    await rm(join(PUBLISH_DIR, hostname), { recursive: true, force: true });
+    await removeTraefikRouteForDomain(hostname);
+  }
+
+  const imageRepo = `${REGISTRY_URL}/${toDockerName(domain)}`;
+  await buildDockerImage({
+    buildId,
+    domain,
+    workDir,
+    imageTag: `${imageRepo}:latest`,
+  });
+  await run(`docker tag ${imageRepo}:latest ${imageRepo}:${buildId}`);
+
+  if (REGISTRY_USER) {
+    // Token via env so it never lands in the logged command or `ps`.
+    await run(
+      `echo "$WS_REGISTRY_TOKEN" | docker login ${REGISTRY_URL.split("/")[0]} -u ${REGISTRY_USER} --password-stdin`,
+      { WS_REGISTRY_TOKEN: REGISTRY_TOKEN }
+    );
+  }
+  log(`Pushing ${imageRepo} (:latest, :${buildId})...`);
+  await run(`docker push ${imageRepo}:latest`);
+  await run(`docker push ${imageRepo}:${buildId}`);
+  try { await run(`docker image prune -f`); } catch {}
+
+  // Trigger the Coolify deploy. A 2xx means the deployment is queued; Coolify
+  // pulls the freshly pushed :latest and recreates the container.
+  log(`Triggering Coolify deploy webhook...`);
+  const response = await fetch(coolifyWebhookUrl, {
+    method: "POST",
+    headers: coolifyWebhookToken
+      ? { Authorization: `Bearer ${coolifyWebhookToken}` }
+      : {},
+  });
+  if (response.ok === false) {
+    const body = await response.text();
+    throw new Error(
+      `Coolify deploy webhook returned ${response.status}: ${body.slice(0, 300)}`
+    );
+  }
+
+  await writeFile(
+    stateFile,
+    JSON.stringify(
+      { mode: "coolify", imageRepo, webhookUrl: coolifyWebhookUrl, publishDomain, customDomains },
+      null,
+      2
+    ) + "\n",
+    "utf8"
+  );
+
+  log(`Successfully triggered Coolify deploy for ${domain} (${imageRepo}:latest)`);
 };
 
 // ─── Site proxy (SSR + SSG) ───────────────────────────────────────────────────
@@ -1308,6 +1500,10 @@ const teardownSite = async (domain, state) => {
     // The site lives on a remote server the publisher does not own — the rsynced
     // files are left in place. Remove them on the remote server if needed.
     log(`${domain} was published over SSH to ${state.sshHost ?? "a remote server"} — remote files were NOT removed`);
+  } else if (mode === "coolify") {
+    // The Coolify app belongs to the site's owner — the publisher can't and
+    // won't delete it. Pushed images are left in the registry.
+    log(`${domain} was published to a remote Coolify — delete the app there; images remain in ${state.imageRepo ?? "the registry"}`);
   }
 
   for (const hostname of hostnames) {
@@ -1386,7 +1582,8 @@ const RENDER_HOSTS = {
   "ssr:local": ({ buildId }) => publishBuildSsr({ buildId }),
   "ssg:cloudflare": ({ buildId }) => publishBuildCloudflare({ buildId }),
   "ssg:ssh": ({ buildId }) => publishBuildSsh({ buildId }),
-  "ssr:coolify": null, // webstudio-self-host#23
+  "ssr:coolify": ({ buildId, coolifyWebhookUrl, coolifyWebhookToken }) =>
+    publishBuildCoolifySsr({ buildId, coolifyWebhookUrl, coolifyWebhookToken }),
   "ssg:coolify": null, // webstudio-self-host#24
 };
 
@@ -1416,6 +1613,7 @@ const availableTargets = () => {
     .filter(([key, runner]) => {
       if (runner === null) return false;
       if (key === "ssg:cloudflare") return cloudflare;
+      if (key === "ssr:coolify") return !!REGISTRY_URL;
       return true;
     })
     .map(([key]) => key);
@@ -1470,6 +1668,17 @@ const server = createServer(async (req, res) => {
         return;
       }
 
+      if (target.host === "coolify" && !REGISTRY_URL) {
+        res.writeHead(400);
+        res.end("REGISTRY_URL must be set on the publisher for host: coolify");
+        return;
+      }
+      if (target.host === "coolify" && !input.coolifyWebhookUrl) {
+        res.writeHead(400);
+        res.end("coolifyWebhookUrl is required for host: coolify");
+        return;
+      }
+
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ success: true }));
 
@@ -1477,7 +1686,14 @@ const server = createServer(async (req, res) => {
       const q = getProjectQueue(tempDomainKey);
 
       q.current = q.current
-        .then(() => runner({ buildId, builderOrigin }))
+        .then(() =>
+          runner({
+            buildId,
+            builderOrigin,
+            coolifyWebhookUrl: input.coolifyWebhookUrl,
+            coolifyWebhookToken: input.coolifyWebhookToken,
+          })
+        )
         .then(() => notifyBuildStatus(buildId, "PUBLISHED"))
         .catch((err) => {
           logErr(`Publish failed for build ${buildId}: ${err.message}`);
@@ -1622,7 +1838,7 @@ const server = createServer(async (req, res) => {
       JSON.stringify({
         // `cloudflare` kept for builder images predating `targets`.
         cloudflare: !!(CF_API_TOKEN && CF_ACCOUNT_ID),
-        coolify: false,
+        coolify: !!REGISTRY_URL,
         ssh: true,
         // `${renderMode}:${host}` pairs this publisher can run right now.
         targets: availableTargets(),
