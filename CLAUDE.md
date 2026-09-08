@@ -11,9 +11,29 @@ Service Node.js (ESM, no build step) qui publie les sites lors d'une publication
 
 `server.mjs` — tout le service tient dans ce fichier unique. Pas de dépendances npm locales.
 
-## Modes de publication
+## Cibles de publication — `renderMode` × `host`
 
-Le champ `buildMode` dans le body du `POST /publish` détermine la destination (défaut: `"ssg"`).
+Une cible de publication = deux axes orthogonaux dans le body du `POST /publish` :
+
+| `renderMode` | `host` | pipeline | statut |
+|---|---|---|---|
+| `ssg` | `local` | `publishBuild` — Vite prerender → `/var/publish/<host>/` | ✅ |
+| `ssr` | `local` | `publishBuildSsr` — `docker build` + `docker run` par domaine | ✅ |
+| `ssg` | `cloudflare` | `publishBuildCloudflare` — `wrangler pages deploy` | ✅ (si `CLOUDFLARE_*`) |
+| `ssg` | `ssh` | rsync vers serveur distant | 🔜 `501` — self-host#7 |
+| `ssr` | `coolify` | app Coolify distante | 🔜 `501` — self-host#23 |
+| `ssg` | `coolify` | app Coolify distante (nginx) | 🔜 `501` — self-host#24 |
+
+Le mapping request → pipeline vit dans `RENDER_HOSTS` / `normalizeTarget` / `availableTargets`
+(section « Publish target » de `server.mjs`). Les corps de pipeline et le champ interne
+`state.json.mode` (`ssg` / `docker` / `ssr` / `cloudflare`) sont inchangés.
+
+**Champ `buildMode` hérité** — toujours accepté (CLI `webstudio` npm upstream, anciennes
+images builder). Mapping : `ssg` → `ssg`/`local`, `ssr` → `ssr`/`local`,
+`cloudflare` → `ssg`/`cloudflare`.
+
+`GET /capabilities` renvoie `{ cloudflare, coolify, ssh, targets: ["ssg:local", …] }` —
+`targets` = les paires réellement disponibles, que le builder utilise pour griser les autres.
 
 ### `ssr` — Container Docker par domaine
 

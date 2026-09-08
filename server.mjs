@@ -1,13 +1,20 @@
 /**
  * Self-hosted Webstudio publisher service.
  *
- * Receives publish requests from the builder app and generates static HTML files
- * (SSG) or runs a Node SSR server (SSR) depending on buildMode.
+ * Receives publish requests from the builder app and either generates static
+ * HTML files (SSG) or runs a Node server (SSR), served locally or shipped to a
+ * remote host.
  *
- * Build modes (POST /publish { buildId, builderOrigin, buildMode }):
- *   ssg        — Vite prerender → static files in /var/publish/<domain>/
- *   cloudflare — React Router build + wrangler pages deploy
- *   ssr        — React Router build → docker build + docker run, one container per domain
+ * A publish target has two orthogonal axes (POST /publish):
+ *   renderMode — "ssg" (Vite prerender → static files in /var/publish/<domain>/)
+ *              | "ssr" (React Router → docker build + docker run, one container
+ *                per domain)
+ *   host       — "local" (served by this publisher) | "cloudflare" (wrangler
+ *                pages deploy) | "coolify" | "ssh"   (coolify/ssh: planned, 501)
+ *
+ * The legacy `buildMode` field is still accepted (upstream `webstudio` CLI, older
+ * builder images): ssg → ssg/local, ssr → ssr/local, cloudflare → ssg/cloudflare.
+ * See RENDER_HOSTS / normalizeTarget below.
  *
  * SSR proxy (port PROXY_PORT, default 4001):
  *   Serves all published sites — SSR domains are proxied to their Docker container,
@@ -1338,6 +1345,65 @@ const unpublishHostname = async (hostname) => {
   return { removed: false, teardown: false };
 };
 
+// ─── Publish target: renderMode × host ───────────────────────────────────────
+//
+// A publish target is two orthogonal axes — what to build (renderMode) and where
+// it is served (host). This layer resolves an incoming /publish request to one
+// pair and picks the pipeline. The pipeline bodies and the internal state.json
+// `mode` field are unchanged; only the request → pipeline mapping lives here.
+
+// Legacy `buildMode` wire value → { renderMode, host }. Still sent by the
+// upstream `webstudio` npm CLI and by builder images predating the two-axis API.
+const LEGACY_BUILD_MODE = {
+  ssg: { renderMode: "ssg", host: "local" },
+  ssr: { renderMode: "ssr", host: "local" },
+  cloudflare: { renderMode: "ssg", host: "cloudflare" },
+};
+
+// `${renderMode}:${host}` → pipeline runner. `null` marks a planned target that
+// is not implemented yet: it is answered with 501 (not 400) so the builder can
+// tell "coming soon" apart from a bad request.
+const RENDER_HOSTS = {
+  "ssg:local": ({ buildId, builderOrigin }) =>
+    publishBuild({ buildId, builderOrigin }),
+  "ssr:local": ({ buildId }) => publishBuildSsr({ buildId }),
+  "ssg:cloudflare": ({ buildId }) => publishBuildCloudflare({ buildId }),
+  "ssg:ssh": null, // webstudio-self-host#7
+  "ssr:coolify": null, // webstudio-self-host#23
+  "ssg:coolify": null, // webstudio-self-host#24
+};
+
+/**
+ * Resolve a /publish body to a { renderMode, host } pair.
+ * Prefers the explicit two-axis fields; falls back to the legacy `buildMode`.
+ * Returns null when neither yields a known pair (caller answers 400).
+ */
+const normalizeTarget = (input) => {
+  if (typeof input.renderMode === "string" || typeof input.host === "string") {
+    return {
+      renderMode: input.renderMode ?? "ssg",
+      host: input.host ?? "local",
+    };
+  }
+  return LEGACY_BUILD_MODE[input.buildMode ?? "ssg"] ?? null;
+};
+
+/**
+ * The list of `${renderMode}:${host}` targets this publisher can actually run
+ * right now, given its configuration. Consumed by GET /capabilities so the
+ * builder can disable the targets it must not offer.
+ */
+const availableTargets = () => {
+  const cloudflare = !!(CF_API_TOKEN && CF_ACCOUNT_ID);
+  return Object.entries(RENDER_HOSTS)
+    .filter(([key, runner]) => {
+      if (runner === null) return false;
+      if (key === "ssg:cloudflare") return cloudflare;
+      return true;
+    })
+    .map(([key]) => key);
+};
+
 // ─── Build API server ─────────────────────────────────────────────────────────
 
 const server = createServer(async (req, res) => {
@@ -1354,20 +1420,34 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      const { buildId, builderOrigin, buildMode = "ssg" } = input;
+      const { buildId, builderOrigin } = input;
       if (!buildId || !builderOrigin) {
         res.writeHead(400);
         res.end("Missing buildId or builderOrigin");
         return;
       }
 
-      if (buildMode !== "ssg" && buildMode !== "cloudflare" && buildMode !== "ssr") {
+      const target = normalizeTarget(input);
+      if (target === null) {
         res.writeHead(400);
-        res.end(`Unknown buildMode: ${buildMode}`);
+        res.end(`Unknown buildMode: ${input.buildMode}`);
         return;
       }
 
-      if (buildMode === "cloudflare" && (!CF_API_TOKEN || !CF_ACCOUNT_ID)) {
+      const targetKey = `${target.renderMode}:${target.host}`;
+      const runner = RENDER_HOSTS[targetKey];
+      if (runner === undefined) {
+        res.writeHead(400);
+        res.end(`Unknown publish target: ${targetKey}`);
+        return;
+      }
+      if (runner === null) {
+        res.writeHead(501);
+        res.end(`Publish target "${targetKey}" is not implemented yet`);
+        return;
+      }
+
+      if (target.host === "cloudflare" && (!CF_API_TOKEN || !CF_ACCOUNT_ID)) {
         res.writeHead(400);
         res.end("CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID must be set for cloudflare builds");
         return;
@@ -1378,15 +1458,9 @@ const server = createServer(async (req, res) => {
 
       const tempDomainKey = `${builderOrigin}:${buildId}`;
       const q = getProjectQueue(tempDomainKey);
-      const job =
-        buildMode === "cloudflare"
-          ? () => publishBuildCloudflare({ buildId })
-          : buildMode === "ssr"
-            ? () => publishBuildSsr({ buildId })
-            : () => publishBuild({ buildId, builderOrigin });
 
       q.current = q.current
-        .then(job)
+        .then(() => runner({ buildId, builderOrigin }))
         .then(() => notifyBuildStatus(buildId, "PUBLISHED"))
         .catch((err) => {
           logErr(`Publish failed for build ${buildId}: ${err.message}`);
@@ -1431,7 +1505,16 @@ const server = createServer(async (req, res) => {
 
   if (req.method === "GET" && req.url === "/capabilities") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ cloudflare: !!(CF_API_TOKEN && CF_ACCOUNT_ID) }));
+    res.end(
+      JSON.stringify({
+        // `cloudflare` kept for builder images predating `targets`.
+        cloudflare: !!(CF_API_TOKEN && CF_ACCOUNT_ID),
+        coolify: false,
+        ssh: false,
+        // `${renderMode}:${host}` pairs this publisher can run right now.
+        targets: availableTargets(),
+      })
+    );
     return;
   }
 
@@ -1451,7 +1534,7 @@ const server = createServer(async (req, res) => {
 try {
   await execAsync("docker info");
 } catch {
-  logErr("Warning: Docker socket not accessible — buildMode 'ssr' will not work. Mount /var/run/docker.sock into this container.");
+  logErr("Warning: Docker socket not accessible — the 'ssr' render mode will not work. Mount /var/run/docker.sock into this container.");
 }
 
 const ownHostname = process.env.HOSTNAME ?? "";
