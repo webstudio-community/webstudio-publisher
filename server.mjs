@@ -384,6 +384,43 @@ const patchDataFilesForPrerender = async (dir) => {
   }
 };
 
+/**
+ * Nginx / the proxy serve from /var/publish/$host. Bare wstd slugs (no dot) are
+ * qualified with PUBLISHER_HOST to match the full hostname; custom domains (with
+ * a dot) are used as-is.
+ */
+const qualifyPublishDomain = (domain) =>
+  !domain.includes(".") && PUBLISHER_HOST
+    ? `${domain}.${PUBLISHER_HOST}`
+    : domain;
+
+/**
+ * Walk a directory and rewrite every .html / .xml file through `transform`.
+ * .xml is included because the sitemaps protocol requires absolute URLs under
+ * the host serving the sitemap, so each domain's copy is rewritten like the HTML.
+ */
+const transformOutputFiles = async (dir, transform) => {
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const fullPath = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      await transformOutputFiles(fullPath, transform);
+    } else if (entry.name.endsWith(".html") || entry.name.endsWith(".xml")) {
+      const content = await readFile(fullPath, "utf8");
+      const fixed = transform(content);
+      if (fixed !== content) {
+        await writeFile(fullPath, fixed, "utf8");
+        log(`  Updated URLs in ${fullPath}`);
+      }
+    }
+  }
+};
+
 // ─── Docker mode: container routing ──────────────────────────────────────────
 
 // hostname (publishDomain or customDomain) → Docker container name
@@ -539,13 +576,8 @@ const publishBuildCloudflare = async ({ buildId }) => {
     log(`Custom domains: ${customDomains.join(", ")}`);
   }
 
-  // Matches publishBuild: bare slugs are qualified with PUBLISHER_HOST, custom
-  // domains are already fully qualified. Only used to find what a previous
-  // publish left behind locally.
-  const publishDomain =
-    !domain.includes(".") && PUBLISHER_HOST
-      ? `${domain}.${PUBLISHER_HOST}`
-      : domain;
+  // Only used to find what a previous publish left behind locally.
+  const publishDomain = qualifyPublishDomain(domain);
 
   const workDir = join(WORK_DIR, domain);
   await mkdir(workDir, { recursive: true });
@@ -658,50 +690,17 @@ const publishBuildCloudflare = async ({ buildId }) => {
 };
 
 /**
- * Generate static files for the given build and write to /var/publish/<domain>/.
- * If the domain previously had an SSR process running, it is stopped first.
+ * Sync the build and produce the static SSG output in workDir/dist/client/.
+ *
+ * Shared by the local SSG pipeline (publishBuild) and any pipeline that ships
+ * the same static output elsewhere: both need the exact same sync → generate →
+ * vite build, they only differ in what they do with the resulting directory.
+ *
+ * Absolute URLs in the output are rewritten from the Docker-internal origin to
+ * `publicOrigin` (og:url, sitemap <loc>; og:image / twitter:image are made
+ * absolute). Returns the dist dir.
  */
-const publishBuild = async ({ buildId, builderOrigin }) => {
-  log(`Starting SSG publish for build ${buildId}`);
-
-  const { projectDomain: domain, customDomains } = await getProjectBuildInfo(buildId);
-  log(`Project domain: ${domain}`);
-  if (customDomains.length > 0) {
-    log(`Custom domains: ${customDomains.join(", ")}`);
-  }
-
-  // Nginx / proxy serves from /var/publish/$host — for wstd slugs (no dot), append
-  // PUBLISHER_HOST to match the full hostname. Custom domains are used as-is.
-  const publishDomain =
-    !domain.includes(".") && PUBLISHER_HOST
-      ? `${domain}.${PUBLISHER_HOST}`
-      : domain;
-
-  const workDir = join(WORK_DIR, domain);
-  await mkdir(workDir, { recursive: true });
-
-  // Handle mode transitions → ssg
-  const stateFile = join(workDir, "state.json");
-  try {
-    const prevState = JSON.parse(await readFile(stateFile, "utf8"));
-    if (prevState.mode === "docker") {
-      await stopDockerForDomain(domain, prevState.containerName, prevState.publishDomain, prevState.customDomains ?? []);
-      await rm(stateFile, { force: true });
-    } else if (prevState.mode === "cloudflare") {
-      // Deleting the Pages project is a destructive call into the user's
-      // Cloudflare account, so it is left alone deliberately. Say so, because
-      // the site stays reachable at <project>.pages.dev after this publish.
-      // The staging domain, though, now serves this SSG build again — drop
-      // its reverse-proxy route or it would keep going to the old Cloudflare
-      // deployment instead of the fresh /var/publish output below.
-      cfProjectHost.delete(prevState.publishDomain);
-      log(`${domain} was on Cloudflare Pages — project "${prevState.cfProjectName}" left in place and still live`);
-      await rm(stateFile, { force: true });
-    }
-  } catch {
-    // No state.json or unknown mode — nothing to stop
-  }
-
+const buildSsgOutput = async ({ buildId, domain, workDir, publicOrigin }) => {
   const run = async (cmd) => {
     log(`  $ ${cmd}`);
     const { stdout, stderr } = await execAsync(cmd, { cwd: workDir, maxBuffer: 10 * 1024 * 1024 });
@@ -812,30 +811,9 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
   }
 
   // 4b. Fix absolute URLs in generated output:
-  //   - og:url leaks the Docker-internal origin (e.g. http://app:3000) → replace with public HTTPS domain
+  //   - og:url leaks the Docker-internal origin (e.g. http://app:3000) → replace with publicOrigin
   //   - og:image / twitter:image are relative paths → make absolute for social scrapers
   //   - sitemap.xml <loc> entries carry the same internal origin
-  // .xml is included because the sitemaps protocol requires absolute URLs that
-  // sit under the host serving the sitemap, so each domain's copy below has to
-  // be rewritten just like the HTML.
-  const publicOrigin = `https://${publishDomain}`;
-  const transformOutputFiles = async (dir, transform) => {
-    let entries;
-    try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
-    for (const entry of entries) {
-      const fullPath = join(dir, entry.name);
-      if (entry.isDirectory()) {
-        await transformOutputFiles(fullPath, transform);
-      } else if (entry.name.endsWith(".html") || entry.name.endsWith(".xml")) {
-        const content = await readFile(fullPath, "utf8");
-        const fixed = transform(content);
-        if (fixed !== content) {
-          await writeFile(fullPath, fixed, "utf8");
-          log(`  Updated URLs in ${fullPath}`);
-        }
-      }
-    }
-  };
   log(`Fixing absolute URLs in generated output...`);
   await transformOutputFiles(distDir, (html) => {
     let out = html.replaceAll(BUILDER_INTERNAL_URL, publicOrigin);
@@ -844,13 +822,60 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
     return out;
   });
 
+  return distDir;
+};
+
+/**
+ * Generate static files for the given build and write them to /var/publish/,
+ * one directory per hostname (the staging domain + each verified custom domain).
+ * A previous runtime (Docker container, Cloudflare route) is torn down first.
+ */
+const publishBuild = async ({ buildId }) => {
+  log(`Starting SSG publish for build ${buildId}`);
+
+  const { projectDomain: domain, customDomains } = await getProjectBuildInfo(buildId);
+  log(`Project domain: ${domain}`);
+  if (customDomains.length > 0) {
+    log(`Custom domains: ${customDomains.join(", ")}`);
+  }
+
+  const publishDomain = qualifyPublishDomain(domain);
+  const workDir = join(WORK_DIR, domain);
+  await mkdir(workDir, { recursive: true });
+
+  // Handle mode transitions → ssg
+  const stateFile = join(workDir, "state.json");
+  try {
+    const prevState = JSON.parse(await readFile(stateFile, "utf8"));
+    if (prevState.mode === "docker") {
+      await stopDockerForDomain(domain, prevState.containerName, prevState.publishDomain, prevState.customDomains ?? []);
+      await rm(stateFile, { force: true });
+    } else if (prevState.mode === "cloudflare") {
+      // Deleting the Pages project is a destructive call into the user's
+      // Cloudflare account, so it is left alone deliberately. Say so, because
+      // the site stays reachable at <project>.pages.dev after this publish.
+      // The staging domain, though, now serves this SSG build again — drop
+      // its reverse-proxy route or it would keep going to the old Cloudflare
+      // deployment instead of the fresh /var/publish output below.
+      cfProjectHost.delete(prevState.publishDomain);
+      log(`${domain} was on Cloudflare Pages — project "${prevState.cfProjectName}" left in place and still live`);
+      await rm(stateFile, { force: true });
+    }
+  } catch {
+    // No state.json or unknown mode — nothing to stop
+  }
+
+  const publicOrigin = `https://${publishDomain}`;
+  const distDir = await buildSsgOutput({ buildId, domain, workDir, publicOrigin });
+
   // 5. Copy built files to the serve directory
   const destDir = join(PUBLISH_DIR, publishDomain);
   log(`Publishing ${domain} to ${destDir}...`);
   await rm(destDir, { recursive: true, force: true });
   await cp(distDir, destDir, { recursive: true });
 
-  // 5b. Also copy to each verified custom domain directory, rewriting og:url to the custom domain.
+  // 5b. Also copy to each verified custom domain directory, rewriting the origin
+  // baked in above to the custom domain.
   for (const customDomain of customDomains) {
     const customDestDir = join(PUBLISH_DIR, customDomain);
     log(`Publishing custom domain ${customDomain} to ${customDestDir}...`);
@@ -899,10 +924,7 @@ const publishBuildSsr = async ({ buildId }) => {
     log(`Custom domains: ${customDomains.join(", ")}`);
   }
 
-  const publishDomain =
-    !domain.includes(".") && PUBLISHER_HOST
-      ? `${domain}.${PUBLISHER_HOST}`
-      : domain;
+  const publishDomain = qualifyPublishDomain(domain);
 
   const workDir = join(WORK_DIR, domain);
   await mkdir(workDir, { recursive: true });
@@ -1237,8 +1259,7 @@ const LEGACY_BUILD_MODE = {
 // is not implemented yet: it is answered with 501 (not 400) so the builder can
 // tell "coming soon" apart from a bad request.
 const RENDER_HOSTS = {
-  "ssg:local": ({ buildId, builderOrigin }) =>
-    publishBuild({ buildId, builderOrigin }),
+  "ssg:local": ({ buildId }) => publishBuild({ buildId }),
   "ssr:local": ({ buildId }) => publishBuildSsr({ buildId }),
   "ssg:cloudflare": ({ buildId }) => publishBuildCloudflare({ buildId }),
   "ssg:ssh": null, // webstudio-self-host#7
