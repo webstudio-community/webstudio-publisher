@@ -187,12 +187,22 @@ passé via `--build-arg WEBSTUDIO_REF`. Le CI (`docker-publish.yml`) lit le labe
 et l'utilise comme ref → le CLI du publisher est toujours au **même commit que le
 builder déployé**. Ne jamais revenir à `npm install -g webstudio@latest`.
 
-**Tester une branche builder non mergée** : `docker-publish.yml` accepte deux inputs
+**Tester une branche builder non mergée** : `docker-publish.yml` accepte trois inputs
 de `workflow_dispatch` — `builder_ref` (branche/tag/commit du fork, court-circuite la
-lecture du label) et `image_tag` (optionnel, défaut `builder-<ref>`). Une image ainsi
+lecture du label), `image_tag` (optionnel, défaut `builder-<ref>`) et `nonce`
+(optionnel, marqueur repris dans le `run-name` pour qu'un dispatcher automatique
+retrouve le run). Une image ainsi
 pinnée n'est **jamais** taguée `:latest`, même dispatchée depuis `main` : c'est le
 rôle de la sortie `pinned` du step « Compute branch tag », car `github.ref` vaut
 `refs/heads/main` sur un dispatch depuis `main` et suffirait sinon à écraser `:latest`.
+
+Depuis le fork, **chaque PR interne déclenche ce dispatch automatiquement** (job
+`publisher-test-image` de `docker-publish.yml` côté fork) : `builder_ref` = la branche
+de la PR, `nonce` = `pr<N>-<run_id>-<attempt>`. Le fork attend la fin du build puis
+poste/édite un commentaire unique dans la PR avec les deux refs d'images
+(`builder:<branche>` + `webstudio-publisher:builder-<branche>`). À la fermeture de la
+PR, le `docker-cleanup.yml` du fork dispatche celui d'ici (input `tag`) pour supprimer
+l'image de test.
 
 `builder_ref` est résolu en **SHA** via `git ls-remote` avant le build : le stage
 `cli-build` cache `git checkout "$WEBSTUDIO_REF"` sur une couche keyée par la valeur

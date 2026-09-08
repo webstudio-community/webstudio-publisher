@@ -1,5 +1,14 @@
 name: Docker — Build & Publish
 
+# When dispatched with a builder_ref (a test build for an unmerged builder
+# branch), echo it — and the caller's nonce — into the run name so an automated
+# dispatcher (the fork's docker-publish workflow) can pick this exact run out of
+# `gh run list` among concurrent dispatches. Plain runs keep the default name.
+run-name: >-
+  ${{ inputs.builder_ref
+      && format('Docker — test image for {0}{1}', inputs.builder_ref, inputs.nonce && format(' (nonce {0})', inputs.nonce) || '')
+      || 'Docker — Build & Publish' }}
+
 on:
   push:
     branches:
@@ -22,6 +31,13 @@ on:
         description: >-
           Tag for the test image. Only used together with builder_ref;
           defaults to builder-<sanitized builder_ref>.
+        required: false
+        type: string
+      nonce:
+        description: >-
+          Opaque marker echoed into the run name so an automated dispatcher can
+          locate this exact run. Ignored by the build itself. Leave empty for
+          manual dispatches.
         required: false
         type: string
 

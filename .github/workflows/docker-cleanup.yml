@@ -3,6 +3,16 @@ name: Docker — Cleanup PR images
 on:
   pull_request:
     types: [closed]
+  # Dispatched by the fork's docker-cleanup workflow when a builder PR closes, to
+  # drop the matching `builder-<branch>` test image built for that PR (the fork
+  # can't compute the publisher tag itself without duplicating the deletion logic
+  # that lives here).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Image tag to delete (e.g. builder-my-branch).
+        required: true
+        type: string
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -18,9 +28,16 @@ jobs:
     steps:
       - name: Compute branch tag
         id: branch
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          HEAD_REF: ${{ github.head_ref }}
         run: |
-          BRANCH="${{ github.head_ref }}"
-          SAFE=$(echo "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/-\+/-/g' | sed 's/^-//;s/-$//')
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            SAFE="$INPUT_TAG"
+          else
+            SAFE=$(echo "$HEAD_REF" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/-\+/-/g' | sed 's/^-//;s/-$//')
+          fi
           echo "tag=$SAFE" >> "$GITHUB_OUTPUT"
 
       - name: Delete GHCR image version for branch tag
