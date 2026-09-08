@@ -10,13 +10,15 @@
  *              | "ssr" (React Router → docker build + docker run, one container
  *                per domain)
  *   host       — "local" (served by this publisher) | "cloudflare" (wrangler
- *                pages deploy) | "coolify" | "ssh"   (coolify/ssh: planned, 501)
+ *                pages deploy) | "ssh" (SSG output rsync'd to a remote server,
+ *                target set once per domain via POST /targets/ssh-setup)
+ *                | "coolify"   (coolify: planned, 501)
  *
  * The legacy `buildMode` field is still accepted (upstream `webstudio` CLI, older
  * builder images): ssg → ssg/local, ssr → ssr/local, cloudflare → ssg/cloudflare.
  * See RENDER_HOSTS / normalizeTarget below.
  *
- * SSR proxy (port PROXY_PORT, default 4001):
+ * Site proxy (port PROXY_PORT, default 4001):
  *   Serves all published sites — SSR domains are proxied to their Docker container,
  *   SSG domains are served directly from /var/publish/<domain>/, and the local staging
  *   domain of a cloudflare-mode site is reverse-proxied to <cfProjectName>.pages.dev.
@@ -27,15 +29,14 @@
  *   BUILDER_INTERNAL_URL   — internal Docker URL for the builder (default: http://app:3000)
  *   PORT                   — build API HTTP port (default: 4000)
  *   PROXY_PORT             — site proxy HTTP port (default: 4001)
- *   SSR_PORT_BASE          — base port for legacy SSR subprocesses (default: 5000)
  *   DOCKER_NETWORK         — Docker network shared with site containers (required for SSR mode)
  */
 
 import { createServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { exec, spawn } from "node:child_process";
+import { exec } from "node:child_process";
 import { createReadStream } from "node:fs";
-import { mkdir, cp, rm, access, readdir, readFile, writeFile, stat } from "node:fs/promises";
+import { mkdir, cp, rm, access, readdir, readFile, writeFile, stat, chmod } from "node:fs/promises";
 import { join, extname } from "node:path";
 import { promisify } from "node:util";
 import { networkInterfaces } from "node:os";
@@ -44,7 +45,6 @@ const execAsync = promisify(exec);
 
 const PORT = process.env.PORT ?? "4000";
 const PROXY_PORT = process.env.PROXY_PORT ?? "4001";
-const SSR_PORT_BASE = parseInt(process.env.SSR_PORT_BASE ?? "5000");
 const SERVICE_TOKEN = process.env.TRPC_SERVER_API_TOKEN ?? "";
 const PUBLISHER_HOST = process.env.PUBLISHER_HOST ?? "";
 const CF_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN ?? "";
@@ -72,80 +72,11 @@ let OWN_CONTAINER_NAME = "";
 const log = (msg) => console.info(`[publisher] ${msg}`);
 const logErr = (msg) => console.error(`[publisher] ${msg}`);
 
-// ─── SSR process management ──────────────────────────────────────────────────
-
-// domain (project slug) → port number (persisted across restarts via state.json)
-const ssrDomainPort = new Map();
-// hostname (publishDomain or customDomain) → port number (for proxy routing)
-const ssrHostPort = new Map();
-// domain (project slug) → ChildProcess
-const ssrProcesses = new Map();
-// Next available port for a new SSR domain
-let nextSsrPort = SSR_PORT_BASE + 1;
-
-/**
- * Return the persistent port for an SSR domain, allocating a new one if needed.
- */
-const allocateSsrPort = (domain) => {
-  if (ssrDomainPort.has(domain)) return ssrDomainPort.get(domain);
-  const port = nextSsrPort++;
-  ssrDomainPort.set(domain, port);
-  return port;
-};
-
-/**
- * Start (or restart on republish) the react-router-serve process for an SSR site.
- * If a process is already running for this domain, it is killed first — the old
- * process keeps serving during the rebuild so there is no downtime.
- */
-const startSsrProcess = (domain, workDir, port) => {
-  const existing = ssrProcesses.get(domain);
-  if (existing) {
-    log(`Stopping previous SSR process for ${domain}`);
-    try { existing.kill("SIGTERM"); } catch {}
-    ssrProcesses.delete(domain);
-  }
-
-  const child = spawn(
-    "node",
-    ["node_modules/.bin/react-router-serve", "build/server/index.js"],
-    {
-      cwd: workDir,
-      env: { ...process.env, PORT: String(port) },
-      stdio: "pipe",
-    }
-  );
-
-  child.stdout.on("data", (d) => log(`[ssr:${domain}] ${d.toString().trim()}`));
-  child.stderr.on("data", (d) => logErr(`[ssr:${domain}] ${d.toString().trim()}`));
-  child.on("exit", (code, signal) => {
-    log(`[ssr:${domain}] process exited (code=${code}, signal=${signal})`);
-    ssrProcesses.delete(domain);
-  });
-
-  ssrProcesses.set(domain, child);
-  return child;
-};
-
-/**
- * Stop a running SSR process and remove its proxy routing entries.
- * Called when a domain is republished in SSG mode (mode switch).
- */
-const stopSsrForDomain = (domain, publishDomain, customDomains) => {
-  const proc = ssrProcesses.get(domain);
-  if (proc) {
-    log(`Stopping SSR process for ${domain} (switching to SSG)`);
-    try { proc.kill("SIGTERM"); } catch {}
-    ssrProcesses.delete(domain);
-  }
-  ssrHostPort.delete(publishDomain);
-  for (const cd of customDomains) ssrHostPort.delete(cd);
-  ssrDomainPort.delete(domain);
-};
+// ─── Docker container management ─────────────────────────────────────────────
 
 /**
  * Stop a running Docker container and remove its proxy routing entries.
- * Called on mode switches away from docker (→ ssg, → ssr, → cloudflare).
+ * Called on mode switches away from docker (→ ssg, → cloudflare, → ssh).
  */
 const stopDockerForDomain = async (domain, containerName, publishDomain, customDomains) => {
   log(`Stopping Docker container ${containerName} for ${domain}`);
@@ -156,10 +87,11 @@ const stopDockerForDomain = async (domain, containerName, publishDomain, customD
 };
 
 /**
- * On publisher startup, read state.json files and restore SSR processes and
- * Docker containers. Reconstructs ssrHostPort so the proxy routes correctly.
+ * On publisher startup, read state.json files and restore what each published
+ * site needs: Docker containers are started, Cloudflare staging routes are
+ * re-registered. SSG and SSH sites need nothing (files on disk / a remote host).
  */
-const restoreSsrProcesses = async () => {
+const restoreTargets = async () => {
   let entries;
   try {
     entries = await readdir(WORK_DIR, { withFileTypes: true });
@@ -174,25 +106,7 @@ const restoreSsrProcesses = async () => {
     try {
       const state = JSON.parse(await readFile(stateFile, "utf8"));
 
-      if (state.mode === "ssr") {
-        const { port, publishDomain, customDomains = [] } = state;
-        const workDir = join(WORK_DIR, domain);
-        const serverEntry = join(workDir, "build", "server", "index.js");
-
-        if (!(await pathExists(serverEntry))) {
-          log(`Skipping SSR restore for ${domain}: build/server/index.js not found`);
-          continue;
-        }
-
-        ssrDomainPort.set(domain, port);
-        if (port >= nextSsrPort) nextSsrPort = port + 1;
-        ssrHostPort.set(publishDomain, port);
-        for (const cd of customDomains) ssrHostPort.set(cd, port);
-
-        startSsrProcess(domain, workDir, port);
-        log(`Restored SSR process for ${domain} (port ${port})`);
-
-      } else if (state.mode === "docker") {
+      if (state.mode === "docker") {
         const { port, containerName, publishDomain, customDomains = [] } = state;
 
         // Ensure the container is running — restart it if stopped
@@ -419,6 +333,12 @@ http:
   log(`Wrote Traefik route config for ${domain}`);
 };
 
+/** Remove the per-domain Traefik dynamic config written by writeTraefikRouteForDomain. */
+const removeTraefikRouteForDomain = async (domain) => {
+  if (!TRAEFIK_DYNAMIC_DIR || !domain.includes(".")) return;
+  await rm(join(TRAEFIK_DYNAMIC_DIR, `${domain}.yaml`), { force: true });
+};
+
 /**
  * Check if a path exists.
  */
@@ -467,6 +387,43 @@ const patchDataFilesForPrerender = async (dir) => {
       if (patched !== content) {
         await writeFile(fullPath, patched, "utf8");
         log(`  Patched prerender origin in ${fullPath}`);
+      }
+    }
+  }
+};
+
+/**
+ * Nginx / the proxy serve from /var/publish/$host. Bare wstd slugs (no dot) are
+ * qualified with PUBLISHER_HOST to match the full hostname; custom domains (with
+ * a dot) are used as-is.
+ */
+const qualifyPublishDomain = (domain) =>
+  !domain.includes(".") && PUBLISHER_HOST
+    ? `${domain}.${PUBLISHER_HOST}`
+    : domain;
+
+/**
+ * Walk a directory and rewrite every .html / .xml file through `transform`.
+ * .xml is included because the sitemaps protocol requires absolute URLs under
+ * the host serving the sitemap, so each domain's copy is rewritten like the HTML.
+ */
+const transformOutputFiles = async (dir, transform) => {
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const fullPath = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      await transformOutputFiles(fullPath, transform);
+    } else if (entry.name.endsWith(".html") || entry.name.endsWith(".xml")) {
+      const content = await readFile(fullPath, "utf8");
+      const fixed = transform(content);
+      if (fixed !== content) {
+        await writeFile(fullPath, fixed, "utf8");
+        log(`  Updated URLs in ${fullPath}`);
       }
     }
   }
@@ -627,13 +584,8 @@ const publishBuildCloudflare = async ({ buildId }) => {
     log(`Custom domains: ${customDomains.join(", ")}`);
   }
 
-  // Matches publishBuild: bare slugs are qualified with PUBLISHER_HOST, custom
-  // domains are already fully qualified. Only used to find what a previous
-  // publish left behind locally.
-  const publishDomain =
-    !domain.includes(".") && PUBLISHER_HOST
-      ? `${domain}.${PUBLISHER_HOST}`
-      : domain;
+  // Only used to find what a previous publish left behind locally.
+  const publishDomain = qualifyPublishDomain(domain);
 
   const workDir = join(WORK_DIR, domain);
   await mkdir(workDir, { recursive: true });
@@ -655,17 +607,14 @@ const publishBuildCloudflare = async ({ buildId }) => {
   const stateFile = join(workDir, "state.json");
   try {
     const prevState = JSON.parse(await readFile(stateFile, "utf8"));
-    if (prevState.mode === "ssr") {
-      stopSsrForDomain(domain, prevState.publishDomain, prevState.customDomains ?? []);
-      log(`Stopped SSR process for ${domain} (switching to Cloudflare)`);
-    } else if (prevState.mode === "docker") {
+    if (prevState.mode === "docker") {
       await stopDockerForDomain(domain, prevState.containerName, prevState.publishDomain, prevState.customDomains ?? []);
       log(`Stopped Docker container for ${domain} (switching to Cloudflare)`);
     }
-  } catch { /* no state.json — new domain, or previously SSG */ }
+  } catch { /* no state.json — brand-new domain */ }
 
-  // SSG leaves no state.json, so clear static output unconditionally rather
-  // than on a detected transition.
+  // Clear any local static output (from a previous SSG publish) unconditionally
+  // — a stale copy under /var/publish would otherwise be served in parallel.
   for (const hostname of [publishDomain, ...customDomains]) {
     await rm(join(PUBLISH_DIR, hostname), { recursive: true, force: true });
   }
@@ -749,53 +698,17 @@ const publishBuildCloudflare = async ({ buildId }) => {
 };
 
 /**
- * Generate static files for the given build and write to /var/publish/<domain>/.
- * If the domain previously had an SSR process running, it is stopped first.
+ * Sync the build and produce the static SSG output in workDir/dist/client/.
+ *
+ * Shared by the local SSG pipeline (publishBuild) and any pipeline that ships
+ * the same static output elsewhere: both need the exact same sync → generate →
+ * vite build, they only differ in what they do with the resulting directory.
+ *
+ * Absolute URLs in the output are rewritten from the Docker-internal origin to
+ * `publicOrigin` (og:url, sitemap <loc>; og:image / twitter:image are made
+ * absolute). Returns the dist dir.
  */
-const publishBuild = async ({ buildId, builderOrigin }) => {
-  log(`Starting SSG publish for build ${buildId}`);
-
-  const { projectDomain: domain, customDomains } = await getProjectBuildInfo(buildId);
-  log(`Project domain: ${domain}`);
-  if (customDomains.length > 0) {
-    log(`Custom domains: ${customDomains.join(", ")}`);
-  }
-
-  // Nginx / proxy serves from /var/publish/$host — for wstd slugs (no dot), append
-  // PUBLISHER_HOST to match the full hostname. Custom domains are used as-is.
-  const publishDomain =
-    !domain.includes(".") && PUBLISHER_HOST
-      ? `${domain}.${PUBLISHER_HOST}`
-      : domain;
-
-  const workDir = join(WORK_DIR, domain);
-  await mkdir(workDir, { recursive: true });
-
-  // Handle mode transitions → ssg
-  const stateFile = join(workDir, "state.json");
-  try {
-    const prevState = JSON.parse(await readFile(stateFile, "utf8"));
-    if (prevState.mode === "ssr") {
-      stopSsrForDomain(domain, prevState.publishDomain, prevState.customDomains ?? []);
-      await rm(stateFile, { force: true });
-    } else if (prevState.mode === "docker") {
-      await stopDockerForDomain(domain, prevState.containerName, prevState.publishDomain, prevState.customDomains ?? []);
-      await rm(stateFile, { force: true });
-    } else if (prevState.mode === "cloudflare") {
-      // Deleting the Pages project is a destructive call into the user's
-      // Cloudflare account, so it is left alone deliberately. Say so, because
-      // the site stays reachable at <project>.pages.dev after this publish.
-      // The staging domain, though, now serves this SSG build again — drop
-      // its reverse-proxy route or it would keep going to the old Cloudflare
-      // deployment instead of the fresh /var/publish output below.
-      cfProjectHost.delete(prevState.publishDomain);
-      log(`${domain} was on Cloudflare Pages — project "${prevState.cfProjectName}" left in place and still live`);
-      await rm(stateFile, { force: true });
-    }
-  } catch {
-    // No state.json or unknown mode — nothing to stop
-  }
-
+const buildSsgOutput = async ({ buildId, domain, workDir, publicOrigin }) => {
   const run = async (cmd) => {
     log(`  $ ${cmd}`);
     const { stdout, stderr } = await execAsync(cmd, { cwd: workDir, maxBuffer: 10 * 1024 * 1024 });
@@ -906,30 +819,9 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
   }
 
   // 4b. Fix absolute URLs in generated output:
-  //   - og:url leaks the Docker-internal origin (e.g. http://app:3000) → replace with public HTTPS domain
+  //   - og:url leaks the Docker-internal origin (e.g. http://app:3000) → replace with publicOrigin
   //   - og:image / twitter:image are relative paths → make absolute for social scrapers
   //   - sitemap.xml <loc> entries carry the same internal origin
-  // .xml is included because the sitemaps protocol requires absolute URLs that
-  // sit under the host serving the sitemap, so each domain's copy below has to
-  // be rewritten just like the HTML.
-  const publicOrigin = `https://${publishDomain}`;
-  const transformOutputFiles = async (dir, transform) => {
-    let entries;
-    try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
-    for (const entry of entries) {
-      const fullPath = join(dir, entry.name);
-      if (entry.isDirectory()) {
-        await transformOutputFiles(fullPath, transform);
-      } else if (entry.name.endsWith(".html") || entry.name.endsWith(".xml")) {
-        const content = await readFile(fullPath, "utf8");
-        const fixed = transform(content);
-        if (fixed !== content) {
-          await writeFile(fullPath, fixed, "utf8");
-          log(`  Updated URLs in ${fullPath}`);
-        }
-      }
-    }
-  };
   log(`Fixing absolute URLs in generated output...`);
   await transformOutputFiles(distDir, (html) => {
     let out = html.replaceAll(BUILDER_INTERNAL_URL, publicOrigin);
@@ -938,13 +830,60 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
     return out;
   });
 
+  return distDir;
+};
+
+/**
+ * Generate static files for the given build and write them to /var/publish/,
+ * one directory per hostname (the staging domain + each verified custom domain).
+ * A previous runtime (Docker container, Cloudflare route) is torn down first.
+ */
+const publishBuild = async ({ buildId }) => {
+  log(`Starting SSG publish for build ${buildId}`);
+
+  const { projectDomain: domain, customDomains } = await getProjectBuildInfo(buildId);
+  log(`Project domain: ${domain}`);
+  if (customDomains.length > 0) {
+    log(`Custom domains: ${customDomains.join(", ")}`);
+  }
+
+  const publishDomain = qualifyPublishDomain(domain);
+  const workDir = join(WORK_DIR, domain);
+  await mkdir(workDir, { recursive: true });
+
+  // Handle mode transitions → ssg
+  const stateFile = join(workDir, "state.json");
+  try {
+    const prevState = JSON.parse(await readFile(stateFile, "utf8"));
+    if (prevState.mode === "docker") {
+      await stopDockerForDomain(domain, prevState.containerName, prevState.publishDomain, prevState.customDomains ?? []);
+      await rm(stateFile, { force: true });
+    } else if (prevState.mode === "cloudflare") {
+      // Deleting the Pages project is a destructive call into the user's
+      // Cloudflare account, so it is left alone deliberately. Say so, because
+      // the site stays reachable at <project>.pages.dev after this publish.
+      // The staging domain, though, now serves this SSG build again — drop
+      // its reverse-proxy route or it would keep going to the old Cloudflare
+      // deployment instead of the fresh /var/publish output below.
+      cfProjectHost.delete(prevState.publishDomain);
+      log(`${domain} was on Cloudflare Pages — project "${prevState.cfProjectName}" left in place and still live`);
+      await rm(stateFile, { force: true });
+    }
+  } catch {
+    // No state.json or unknown mode — nothing to stop
+  }
+
+  const publicOrigin = `https://${publishDomain}`;
+  const distDir = await buildSsgOutput({ buildId, domain, workDir, publicOrigin });
+
   // 5. Copy built files to the serve directory
   const destDir = join(PUBLISH_DIR, publishDomain);
   log(`Publishing ${domain} to ${destDir}...`);
   await rm(destDir, { recursive: true, force: true });
   await cp(distDir, destDir, { recursive: true });
 
-  // 5b. Also copy to each verified custom domain directory, rewriting og:url to the custom domain.
+  // 5b. Also copy to each verified custom domain directory, rewriting the origin
+  // baked in above to the custom domain.
   for (const customDomain of customDomains) {
     const customDestDir = join(PUBLISH_DIR, customDomain);
     log(`Publishing custom domain ${customDomain} to ${customDestDir}...`);
@@ -955,7 +894,123 @@ const publishBuild = async ({ buildId, builderOrigin }) => {
     await writeTraefikRouteForDomain(customDomain);
   }
 
+  // 6. Persist state so the next publish can detect the transition away from SSG
+  // (a Docker / SSH pipeline purges these static files; without a state.json it
+  // has no way to know they exist). restoreTargets() has nothing to do for it.
+  await writeFile(
+    stateFile,
+    JSON.stringify({ mode: "ssg", publishDomain, customDomains }, null, 2) + "\n",
+    "utf8"
+  );
+
   log(`Successfully published ${domain}`);
+};
+
+// ─── Remote SSH pipeline (SSG output → rsync to a remote server) ─────────────
+
+/**
+ * Read the per-domain SSH target written by POST /targets/ssh-setup.
+ * Returns undefined when the site has no SSH target configured yet.
+ */
+const readSshTarget = async (workDir) => {
+  try {
+    return JSON.parse(await readFile(join(workDir, "target.json"), "utf8"));
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * Publish a build as SSG and rsync it to a remote server over SSH.
+ *
+ * The SSH target (host / user / path / port + private key) is configured once
+ * per domain via POST /targets/ssh-setup and stored under /var/work/<domain>/.
+ *
+ * Workflow:
+ *   1. read target.json  (fail with the curl command if the site has none)
+ *   2. tear down whatever was serving this site locally
+ *   3. buildSsgOutput()  (sync → build ssg → vite build → rewrite URLs)
+ *   4. rsync -az --delete dist/client/ → user@host:path/
+ *   5. persist state.json { mode: "ssh", ... }
+ *
+ * The publisher does not serve the site and writes no Traefik config — TLS and
+ * routing on the remote server are the user's responsibility.
+ */
+const publishBuildSsh = async ({ buildId }) => {
+  log(`Starting SSH publish for build ${buildId}`);
+
+  const { projectDomain: domain, customDomains } = await getProjectBuildInfo(buildId);
+  log(`Project domain: ${domain}`);
+  if (customDomains.length > 0) {
+    log(`Custom domains: ${customDomains.join(", ")}`);
+  }
+
+  const publishDomain = qualifyPublishDomain(domain);
+  const workDir = join(WORK_DIR, domain);
+  await mkdir(workDir, { recursive: true });
+
+  const target = await readSshTarget(workDir);
+  if (target === undefined) {
+    throw new Error(
+      `No SSH target configured for "${domain}". Configure one first:\n` +
+        `  curl -X POST <publisher>/targets/ssh-setup -H 'content-type: application/json' \\\n` +
+        `    -d '{"domain":"${domain}","sshHost":"…","sshUser":"…","sshPath":"…","sshPrivateKey":"…"}'`
+    );
+  }
+  const { sshHost, sshUser, sshPath, sshPort = 22, publicUrl } = target;
+
+  // Handle mode transitions → ssh. The site moves to a remote server, so stop
+  // serving it here: kill any container, drop Cloudflare/Traefik routing, and
+  // purge the local static copy.
+  const stateFile = join(workDir, "state.json");
+  let prevState;
+  try {
+    prevState = JSON.parse(await readFile(stateFile, "utf8"));
+  } catch { /* no state.json — new domain, or previously SSG */ }
+  if (prevState?.mode === "docker") {
+    await stopDockerForDomain(domain, prevState.containerName, prevState.publishDomain, prevState.customDomains ?? []);
+  } else if (prevState?.mode === "cloudflare") {
+    cfProjectHost.delete(prevState.publishDomain);
+    log(`${domain} was on Cloudflare Pages — project "${prevState.cfProjectName}" left in place and still live`);
+  }
+  for (const hostname of [publishDomain, ...customDomains]) {
+    await rm(join(PUBLISH_DIR, hostname), { recursive: true, force: true });
+    await removeTraefikRouteForDomain(hostname);
+  }
+
+  // The origin baked into the output: an explicit publicUrl wins, else the first
+  // custom domain, else the wstd hostname (rarely what actually serves the site).
+  const publicOrigin =
+    publicUrl ||
+    (customDomains.length > 0
+      ? `https://${customDomains[0]}`
+      : `https://${publishDomain}`);
+
+  const distDir = await buildSsgOutput({ buildId, domain, workDir, publicOrigin });
+
+  // rsync to the remote server. accept-new trusts the host key on first contact
+  // and pins it afterwards (POST /targets/ssh-setup also pre-seeds known_hosts).
+  const keyPath = join(workDir, "ssh_key");
+  const knownHostsPath = join(workDir, "known_hosts");
+  const sshCmd = `ssh -p ${sshPort} -i ${keyPath} -o UserKnownHostsFile=${knownHostsPath} -o StrictHostKeyChecking=accept-new`;
+  const rsyncCmd = `rsync -az --delete -e "${sshCmd}" ${distDir}/ ${sshUser}@${sshHost}:${sshPath}/`;
+  log(`Deploying ${domain} to ${sshUser}@${sshHost}:${sshPath} ...`);
+  log(`  $ ${rsyncCmd}`);
+  const { stdout, stderr } = await execAsync(rsyncCmd, { cwd: workDir, maxBuffer: 10 * 1024 * 1024 });
+  if (stdout) log(`  stdout: ${stdout.trim()}`);
+  if (stderr) log(`  stderr: ${stderr.trim()}`);
+
+  await writeFile(
+    stateFile,
+    JSON.stringify(
+      { mode: "ssh", publishDomain, customDomains, sshHost, sshPath, publicUrl: publicOrigin },
+      null,
+      2
+    ) + "\n",
+    "utf8"
+  );
+
+  log(`Successfully published ${domain} to ${sshHost}`);
 };
 
 // ─── SSR build pipeline (Docker containers) ──────────────────────────────────
@@ -982,7 +1037,7 @@ const toDockerName = (domain) =>
  *   4. docker build -t <image> .   ← built ONCE, reused for all hostnames
  *   5. docker stop/rm old container + docker run new one
  *   6. docker image prune -f
- *   7. Persist state.json + register all hostnames in ssrHostPort (proxy reuse)
+ *   7. Persist state.json + register all hostnames in dockerHostContainer (proxy)
  */
 const publishBuildSsr = async ({ buildId }) => {
   log(`Starting Docker publish for build ${buildId}`);
@@ -993,10 +1048,7 @@ const publishBuildSsr = async ({ buildId }) => {
     log(`Custom domains: ${customDomains.join(", ")}`);
   }
 
-  const publishDomain =
-    !domain.includes(".") && PUBLISHER_HOST
-      ? `${domain}.${PUBLISHER_HOST}`
-      : domain;
+  const publishDomain = qualifyPublishDomain(domain);
 
   const workDir = join(WORK_DIR, domain);
   await mkdir(workDir, { recursive: true });
@@ -1022,9 +1074,6 @@ const publishBuildSsr = async ({ buildId }) => {
         await rm(join(PUBLISH_DIR, h), { recursive: true, force: true });
       }
       log(`Removed stale SSG output for ${domain}`);
-    } else if (prevState.mode === "ssr") {
-      stopSsrForDomain(domain, prevState.publishDomain, prevState.customDomains ?? []);
-      log(`Stopped SSR process for ${domain} (switching to Docker)`);
     } else if (prevState.mode === "cloudflare") {
       // Same as the SSG path: the Pages project is the user's to delete. The
       // staging domain moves to this Docker container instead, so drop its
@@ -1139,8 +1188,9 @@ if (patched !== c) {
 
 /**
  * Unified HTTP proxy that serves all published Webstudio sites:
- *   - SSR domains  → reverse-proxied to their react-router-serve subprocess
- *   - SSG domains  → served directly from /var/publish/<host>/
+ *   - SSR domains       → reverse-proxied to their Docker container (:3000)
+ *   - Cloudflare domains → the staging hostname is proxied to <project>.pages.dev
+ *   - SSG domains       → served directly from /var/publish/<host>/
  *
  * The self-host stack should route *.PUBLISHER_HOST traffic here (PROXY_PORT).
  */
@@ -1168,33 +1218,6 @@ const proxyServer = createServer(async (req, res) => {
       if (!res.headersSent) {
         res.writeHead(502);
         res.end("Docker proxy error");
-      }
-    });
-    req.pipe(proxyReq, { end: true });
-    return;
-  }
-
-  // Legacy SSR subprocess: proxy to react-router-serve on 127.0.0.1
-  const ssrPort = ssrHostPort.get(host);
-  if (ssrPort !== undefined) {
-    const proxyReq = httpRequest(
-      {
-        hostname: "127.0.0.1",
-        port: ssrPort,
-        path: req.url,
-        method: req.method,
-        headers: { ...req.headers, host },
-      },
-      (proxyRes) => {
-        res.writeHead(proxyRes.statusCode, proxyRes.headers);
-        proxyRes.pipe(res, { end: true });
-      }
-    );
-    proxyReq.on("error", (err) => {
-      logErr(`SSR proxy error for ${host}: ${err.message}`);
-      if (!res.headersSent) {
-        res.writeHead(502);
-        res.end("SSR proxy error");
       }
     });
     req.pipe(proxyReq, { end: true });
@@ -1242,20 +1265,14 @@ const proxyServer = createServer(async (req, res) => {
 
 // ─── Unpublish ────────────────────────────────────────────────────────────────
 
-const removeTraefikRouteForDomain = async (domain) => {
-  if (!TRAEFIK_DYNAMIC_DIR || !domain.includes(".")) return;
-  await rm(join(TRAEFIK_DYNAMIC_DIR, `${domain}.yaml`), { force: true });
-};
-
 /**
  * Drop a single hostname from a site that still has other hostnames.
  * state.json is rewritten to list exactly the hostnames that remain live, so a
- * later restoreSsrProcesses() does not re-register the removed one.
+ * later restoreTargets() does not re-register the removed one.
  */
 const removeHostname = async (stateFile, state, hostname, remaining) => {
   log(`Removing hostname ${hostname} (site keeps ${remaining.join(", ")})`);
   dockerHostContainer.delete(hostname);
-  ssrHostPort.delete(hostname);
   await rm(join(PUBLISH_DIR, hostname), { recursive: true, force: true });
   await removeTraefikRouteForDomain(hostname);
   const [publishDomain, ...customDomains] = remaining;
@@ -1282,23 +1299,24 @@ const teardownSite = async (domain, state) => {
       try { await execAsync(`docker rmi ${imageName}`); } catch {}
       try { await execAsync(`docker volume rm ${imageName}-ipx-cache`); } catch {}
     }
-  } else if (mode === "ssr") {
-    stopSsrForDomain(domain, publishDomain, customDomains);
   } else if (mode === "cloudflare") {
     // Deleting someone's Cloudflare Pages project is a destructive call into
     // their account with different semantics from the local modes, so it is
     // deliberately left out here.
     log(`Cloudflare Pages project for ${domain} was NOT deleted — remove it from the Cloudflare dashboard`);
+  } else if (mode === "ssh") {
+    // The site lives on a remote server the publisher does not own — the rsynced
+    // files are left in place. Remove them on the remote server if needed.
+    log(`${domain} was published over SSH to ${state.sshHost ?? "a remote server"} — remote files were NOT removed`);
   }
 
   for (const hostname of hostnames) {
     dockerHostContainer.delete(hostname);
-    ssrHostPort.delete(hostname);
     await rm(join(PUBLISH_DIR, hostname), { recursive: true, force: true });
     await removeTraefikRouteForDomain(hostname);
   }
 
-  // Last: while state.json exists, restoreSsrProcesses() restarts the site on
+  // Last: while state.json exists, restoreTargets() restarts the site on
   // the next publisher boot, so removing it is what makes the teardown stick.
   await rm(join(WORK_DIR, domain), { recursive: true, force: true });
   log(`Tore down ${domain}`);
@@ -1364,11 +1382,10 @@ const LEGACY_BUILD_MODE = {
 // is not implemented yet: it is answered with 501 (not 400) so the builder can
 // tell "coming soon" apart from a bad request.
 const RENDER_HOSTS = {
-  "ssg:local": ({ buildId, builderOrigin }) =>
-    publishBuild({ buildId, builderOrigin }),
+  "ssg:local": ({ buildId }) => publishBuild({ buildId }),
   "ssr:local": ({ buildId }) => publishBuildSsr({ buildId }),
   "ssg:cloudflare": ({ buildId }) => publishBuildCloudflare({ buildId }),
-  "ssg:ssh": null, // webstudio-self-host#7
+  "ssg:ssh": ({ buildId }) => publishBuildSsh({ buildId }),
   "ssr:coolify": null, // webstudio-self-host#23
   "ssg:coolify": null, // webstudio-self-host#24
 };
@@ -1472,6 +1489,102 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // Configure the SSH target for a domain (host "ssh"). Done once per site — the
+  // private key is not sent on every publish. Stores under /var/work/<domain>/:
+  //   ssh_key      private key, chmod 600, never logged
+  //   target.json  { sshHost, sshUser, sshPath, sshPort, publicUrl }
+  //   known_hosts  ssh-keyscan of sshHost (best-effort)
+  if (req.method === "POST" && req.url === "/targets/ssh-setup") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", async () => {
+      let input;
+      try {
+        input = JSON.parse(body);
+      } catch {
+        res.writeHead(400);
+        res.end("Invalid JSON");
+        return;
+      }
+      const { domain, sshHost, sshUser, sshPath, sshPort = 22, sshPrivateKey, publicUrl } = input;
+      const missing = ["domain", "sshHost", "sshUser", "sshPath", "sshPrivateKey"].filter(
+        (k) => !input[k]
+      );
+      if (missing.length > 0) {
+        res.writeHead(400);
+        res.end(`Missing field(s): ${missing.join(", ")}`);
+        return;
+      }
+      // sshHost / sshUser / sshPath / sshPort are interpolated into shell
+      // commands (ssh-keyscan, rsync) — constrain them to safe shapes.
+      const invalid =
+        /^[A-Za-z0-9.\-:]+$/.test(sshHost) === false
+          ? "sshHost"
+          : /^[A-Za-z0-9._\-]+$/.test(sshUser) === false
+            ? "sshUser"
+            : /^[A-Za-z0-9._/\-]+$/.test(sshPath) === false
+              ? "sshPath"
+              : Number.isInteger(Number(sshPort)) === false ||
+                  Number(sshPort) < 1 ||
+                  Number(sshPort) > 65535
+                ? "sshPort"
+                : undefined;
+      if (invalid !== undefined) {
+        res.writeHead(400);
+        res.end(`Invalid ${invalid}`);
+        return;
+      }
+      if (publicUrl && /^https:\/\/[^\s"']+$/.test(publicUrl) === false) {
+        res.writeHead(400);
+        res.end("Invalid publicUrl (expected https://…)");
+        return;
+      }
+      try {
+        const workDir = join(WORK_DIR, domain);
+        await mkdir(workDir, { recursive: true });
+
+        const keyPath = join(workDir, "ssh_key");
+        await writeFile(
+          keyPath,
+          sshPrivateKey.endsWith("\n") ? sshPrivateKey : sshPrivateKey + "\n",
+          "utf8"
+        );
+        await chmod(keyPath, 0o600);
+
+        await writeFile(
+          join(workDir, "target.json"),
+          JSON.stringify(
+            { sshHost, sshUser, sshPath, sshPort: Number(sshPort), publicUrl: publicUrl ?? null },
+            null,
+            2
+          ) + "\n",
+          "utf8"
+        );
+
+        // Pre-seed known_hosts so the first rsync does not have to trust blindly.
+        try {
+          const { stdout } = await execAsync(`ssh-keyscan -p ${sshPort} -H ${sshHost}`, {
+            maxBuffer: 1024 * 1024,
+          });
+          if (stdout.trim()) {
+            await writeFile(join(workDir, "known_hosts"), stdout, "utf8");
+          }
+        } catch {
+          log(`ssh-keyscan failed for ${sshHost} — first publish will trust the host key on contact`);
+        }
+
+        log(`Configured SSH target for ${domain}: ${sshUser}@${sshHost}:${sshPath}`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true }));
+      } catch (error) {
+        logErr(`ssh-setup failed for ${input.domain}: ${error.message}`);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: error.message }));
+      }
+    });
+    return;
+  }
+
   if (req.method === "POST" && req.url === "/unpublish") {
     let body = "";
     req.on("data", (chunk) => (body += chunk));
@@ -1510,7 +1623,7 @@ const server = createServer(async (req, res) => {
         // `cloudflare` kept for builder images predating `targets`.
         cloudflare: !!(CF_API_TOKEN && CF_ACCOUNT_ID),
         coolify: false,
-        ssh: false,
+        ssh: true,
         // `${renderMode}:${host}` pairs this publisher can run right now.
         targets: availableTargets(),
       })
@@ -1567,10 +1680,10 @@ try {
   logErr("Warning: could not resolve own container name — Traefik configs will use IP (may break on container restart).");
 }
 
-await restoreSsrProcesses();
+await restoreTargets();
 
 proxyServer.listen(PROXY_PORT, () => {
-  log(`Site proxy listening on port ${PROXY_PORT} (SSR + SSG)`);
+  log(`Site proxy listening on port ${PROXY_PORT}`);
 });
 
 server.listen(PORT, () => {
