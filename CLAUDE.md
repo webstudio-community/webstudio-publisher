@@ -22,7 +22,7 @@ Une cible de publication = deux axes orthogonaux dans le body du `POST /publish`
 | `ssg` | `cloudflare` | `publishBuildCloudflare` — `wrangler pages deploy` | ✅ (si `CLOUDFLARE_*`) |
 | `ssg` | `ssh` | `publishBuildSsh` — `rsync` de l'output SSG vers un serveur distant | ✅ (cible par domaine via `POST /targets/ssh-setup`) |
 | `ssr` | `coolify` | `publishBuildCoolifySsr` — image SSR → `REGISTRY_URL` → deploy webhook Coolify | ✅ (si `REGISTRY_URL` ; webhook par publish) |
-| `ssg` | `coolify` | app Coolify distante (nginx) | 🔜 `501` — self-host#24 |
+| `ssg` | `coolify` | `publishBuildCoolifySsg` — `buildSsgOutput` → image `nginx:alpine` → `REGISTRY_URL` → deploy webhook | ✅ (si `REGISTRY_URL` ; webhook par publish) |
 
 Le mapping request → pipeline vit dans `RENDER_HOSTS` / `normalizeTarget` / `availableTargets`
 (section « Publish target » de `server.mjs`). En interne, `state.json.mode` vaut
@@ -107,7 +107,7 @@ oublie le site localement ; les fichiers distants sont laissés en place.
 Image : `rsync` + `openssh-client` (+ `curl` + `jq` pour appeler l'API depuis
 `docker compose exec`) ajoutés au `Dockerfile`.
 
-### `ssr` + `coolify` — SSR sur un Coolify distant
+### `coolify` — SSR ou SSG sur un Coolify distant
 
 Le publisher ne possède aucun identifiant Coolify. Chaque site est hébergé sur
 **le Coolify de son propriétaire**, potentiellement un serveur différent.
@@ -120,13 +120,13 @@ Config **par site** : le `deployWebhookUrl` (+ token optionnel) de l'app Coolify
 envoyé dans le body du `POST /publish` (`coolifyWebhookUrl` / `coolifyWebhookToken`).
 
 ```
-POST /publish { buildId, renderMode: "ssr", host: "coolify", coolifyWebhookUrl, coolifyWebhookToken? }
-  → arrêt de ce qui servait le site localement + purge /var/publish + Traefik
-  → buildDockerImage()  tag = $REGISTRY_URL/ws-<slug>:latest  (+ :<buildId>)
-  → docker login $REGISTRY_URL (si REGISTRY_USER, token via env, jamais loggé)
-  → docker push :latest + :<buildId>
-  → POST coolifyWebhookUrl (Bearer token) → Coolify pull :latest et redéploie
-  → state.json { mode: "coolify", imageRepo, webhookUrl, publishDomain, customDomains }
+POST /publish { buildId, renderMode: "ssr"|"ssg", host: "coolify", coolifyWebhookUrl, coolifyWebhookToken? }
+  → stopLocalServing() : arrêt container/route + purge /var/publish + Traefik
+  → ssr : buildDockerImage()  |  ssg : buildSsgOutput() + Dockerfile nginx:alpine (+ .dockerignore)
+      tag = $REGISTRY_URL/ws-<slug>:latest
+  → deployImageToCoolify() : docker tag :<buildId> ; docker login (token via env) ;
+      docker push :latest + :<buildId> ; POST coolifyWebhookUrl (Bearer)
+  → state.json { mode: "coolify", renderMode, imageRepo, webhookUrl, publishDomain, customDomains }
 ```
 
 Le publisher **ne parle jamais à l'API Coolify** autrement que via ce webhook, ne
@@ -135,8 +135,11 @@ sert pas le site, n'écrit pas de Traefik, et **ne poll pas** (un 2xx du webhook
 les images du registre sont laissées en place (elles appartiennent au client).
 `isSafeWebhookUrl` rejette le non-https et les hôtes loopback/privés (anti-SSRF).
 
-`ENV IPX_HTTP_ALLOW_ALL_DOMAINS=true` + `EXPOSE 3000` sont dans le `DOCKER_SITE_DOCKERFILE`
-→ l'app Coolify du client n'a qu'à pointer sur l'image (port 3000).
+- **SSR** : `DOCKER_SITE_DOCKERFILE` (`ENV IPX_HTTP_ALLOW_ALL_DOMAINS=true` + `EXPOSE 3000`)
+  → l'app Coolify du client pointe sur l'image, port 3000.
+- **SSG** : `COOLIFY_SSG_DOCKERFILE` (`FROM nginx:alpine` + `COPY dist/client` + `nginx.conf`
+  fallback `.html` / cache immutable sur `/_assets`,`/assets`) → port 80. Origine des
+  `og:`/`sitemap` = 1er custom domain publié, sinon hostname wstd.
 
 ### `cloudflare` — Cloudflare Pages
 
