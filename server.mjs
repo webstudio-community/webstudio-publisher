@@ -10,7 +10,9 @@
  *              | "ssr" (React Router → docker build + docker run, one container
  *                per domain)
  *   host       — "local" (served by this publisher) | "cloudflare" (wrangler
- *                pages deploy) | "coolify" | "ssh"   (coolify/ssh: planned, 501)
+ *                pages deploy) | "ssh" (SSG output rsync'd to a remote server,
+ *                target set once per domain via POST /targets/ssh-setup)
+ *                | "coolify"   (coolify: planned, 501)
  *
  * The legacy `buildMode` field is still accepted (upstream `webstudio` CLI, older
  * builder images): ssg → ssg/local, ssr → ssr/local, cloudflare → ssg/cloudflare.
@@ -34,7 +36,7 @@ import { createServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { exec } from "node:child_process";
 import { createReadStream } from "node:fs";
-import { mkdir, cp, rm, access, readdir, readFile, writeFile, stat } from "node:fs/promises";
+import { mkdir, cp, rm, access, readdir, readFile, writeFile, stat, chmod } from "node:fs/promises";
 import { join, extname } from "node:path";
 import { promisify } from "node:util";
 import { networkInterfaces } from "node:os";
@@ -329,6 +331,12 @@ http:
   const configPath = join(TRAEFIK_DYNAMIC_DIR, `${domain}.yaml`);
   await writeFile(configPath, config, "utf8");
   log(`Wrote Traefik route config for ${domain}`);
+};
+
+/** Remove the per-domain Traefik dynamic config written by writeTraefikRouteForDomain. */
+const removeTraefikRouteForDomain = async (domain) => {
+  if (!TRAEFIK_DYNAMIC_DIR || !domain.includes(".")) return;
+  await rm(join(TRAEFIK_DYNAMIC_DIR, `${domain}.yaml`), { force: true });
 };
 
 /**
@@ -889,6 +897,113 @@ const publishBuild = async ({ buildId }) => {
   log(`Successfully published ${domain}`);
 };
 
+// ─── Remote SSH pipeline (SSG output → rsync to a remote server) ─────────────
+
+/**
+ * Read the per-domain SSH target written by POST /targets/ssh-setup.
+ * Returns undefined when the site has no SSH target configured yet.
+ */
+const readSshTarget = async (workDir) => {
+  try {
+    return JSON.parse(await readFile(join(workDir, "target.json"), "utf8"));
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * Publish a build as SSG and rsync it to a remote server over SSH.
+ *
+ * The SSH target (host / user / path / port + private key) is configured once
+ * per domain via POST /targets/ssh-setup and stored under /var/work/<domain>/.
+ *
+ * Workflow:
+ *   1. read target.json  (fail with the curl command if the site has none)
+ *   2. tear down whatever was serving this site locally
+ *   3. buildSsgOutput()  (sync → build ssg → vite build → rewrite URLs)
+ *   4. rsync -az --delete dist/client/ → user@host:path/
+ *   5. persist state.json { mode: "ssh", ... }
+ *
+ * The publisher does not serve the site and writes no Traefik config — TLS and
+ * routing on the remote server are the user's responsibility.
+ */
+const publishBuildSsh = async ({ buildId }) => {
+  log(`Starting SSH publish for build ${buildId}`);
+
+  const { projectDomain: domain, customDomains } = await getProjectBuildInfo(buildId);
+  log(`Project domain: ${domain}`);
+  if (customDomains.length > 0) {
+    log(`Custom domains: ${customDomains.join(", ")}`);
+  }
+
+  const publishDomain = qualifyPublishDomain(domain);
+  const workDir = join(WORK_DIR, domain);
+  await mkdir(workDir, { recursive: true });
+
+  const target = await readSshTarget(workDir);
+  if (target === undefined) {
+    throw new Error(
+      `No SSH target configured for "${domain}". Configure one first:\n` +
+        `  curl -X POST <publisher>/targets/ssh-setup -H 'content-type: application/json' \\\n` +
+        `    -d '{"domain":"${domain}","sshHost":"…","sshUser":"…","sshPath":"…","sshPrivateKey":"…"}'`
+    );
+  }
+  const { sshHost, sshUser, sshPath, sshPort = 22, publicUrl } = target;
+
+  // Handle mode transitions → ssh. The site moves to a remote server, so stop
+  // serving it here: kill any container, drop Cloudflare/Traefik routing, and
+  // purge the local static copy.
+  const stateFile = join(workDir, "state.json");
+  let prevState;
+  try {
+    prevState = JSON.parse(await readFile(stateFile, "utf8"));
+  } catch { /* no state.json — new domain, or previously SSG */ }
+  if (prevState?.mode === "docker") {
+    await stopDockerForDomain(domain, prevState.containerName, prevState.publishDomain, prevState.customDomains ?? []);
+  } else if (prevState?.mode === "cloudflare") {
+    cfProjectHost.delete(prevState.publishDomain);
+    log(`${domain} was on Cloudflare Pages — project "${prevState.cfProjectName}" left in place and still live`);
+  }
+  for (const hostname of [publishDomain, ...customDomains]) {
+    await rm(join(PUBLISH_DIR, hostname), { recursive: true, force: true });
+    await removeTraefikRouteForDomain(hostname);
+  }
+
+  // The origin baked into the output: an explicit publicUrl wins, else the first
+  // custom domain, else the wstd hostname (rarely what actually serves the site).
+  const publicOrigin =
+    publicUrl ||
+    (customDomains.length > 0
+      ? `https://${customDomains[0]}`
+      : `https://${publishDomain}`);
+
+  const distDir = await buildSsgOutput({ buildId, domain, workDir, publicOrigin });
+
+  // rsync to the remote server. accept-new trusts the host key on first contact
+  // and pins it afterwards (POST /targets/ssh-setup also pre-seeds known_hosts).
+  const keyPath = join(workDir, "ssh_key");
+  const knownHostsPath = join(workDir, "known_hosts");
+  const sshCmd = `ssh -p ${sshPort} -i ${keyPath} -o UserKnownHostsFile=${knownHostsPath} -o StrictHostKeyChecking=accept-new`;
+  const rsyncCmd = `rsync -az --delete -e "${sshCmd}" ${distDir}/ ${sshUser}@${sshHost}:${sshPath}/`;
+  log(`Deploying ${domain} to ${sshUser}@${sshHost}:${sshPath} ...`);
+  log(`  $ ${rsyncCmd}`);
+  const { stdout, stderr } = await execAsync(rsyncCmd, { cwd: workDir, maxBuffer: 10 * 1024 * 1024 });
+  if (stdout) log(`  stdout: ${stdout.trim()}`);
+  if (stderr) log(`  stderr: ${stderr.trim()}`);
+
+  await writeFile(
+    stateFile,
+    JSON.stringify(
+      { mode: "ssh", publishDomain, customDomains, sshHost, sshPath, publicUrl: publicOrigin },
+      null,
+      2
+    ) + "\n",
+    "utf8"
+  );
+
+  log(`Successfully published ${domain} to ${sshHost}`);
+};
+
 // ─── SSR build pipeline (Docker containers) ──────────────────────────────────
 
 /**
@@ -1141,11 +1256,6 @@ const proxyServer = createServer(async (req, res) => {
 
 // ─── Unpublish ────────────────────────────────────────────────────────────────
 
-const removeTraefikRouteForDomain = async (domain) => {
-  if (!TRAEFIK_DYNAMIC_DIR || !domain.includes(".")) return;
-  await rm(join(TRAEFIK_DYNAMIC_DIR, `${domain}.yaml`), { force: true });
-};
-
 /**
  * Drop a single hostname from a site that still has other hostnames.
  * state.json is rewritten to list exactly the hostnames that remain live, so a
@@ -1185,6 +1295,10 @@ const teardownSite = async (domain, state) => {
     // their account with different semantics from the local modes, so it is
     // deliberately left out here.
     log(`Cloudflare Pages project for ${domain} was NOT deleted — remove it from the Cloudflare dashboard`);
+  } else if (mode === "ssh") {
+    // The site lives on a remote server the publisher does not own — the rsynced
+    // files are left in place. Remove them on the remote server if needed.
+    log(`${domain} was published over SSH to ${state.sshHost ?? "a remote server"} — remote files were NOT removed`);
   }
 
   for (const hostname of hostnames) {
@@ -1262,7 +1376,7 @@ const RENDER_HOSTS = {
   "ssg:local": ({ buildId }) => publishBuild({ buildId }),
   "ssr:local": ({ buildId }) => publishBuildSsr({ buildId }),
   "ssg:cloudflare": ({ buildId }) => publishBuildCloudflare({ buildId }),
-  "ssg:ssh": null, // webstudio-self-host#7
+  "ssg:ssh": ({ buildId }) => publishBuildSsh({ buildId }),
   "ssr:coolify": null, // webstudio-self-host#23
   "ssg:coolify": null, // webstudio-self-host#24
 };
@@ -1366,6 +1480,102 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // Configure the SSH target for a domain (host "ssh"). Done once per site — the
+  // private key is not sent on every publish. Stores under /var/work/<domain>/:
+  //   ssh_key      private key, chmod 600, never logged
+  //   target.json  { sshHost, sshUser, sshPath, sshPort, publicUrl }
+  //   known_hosts  ssh-keyscan of sshHost (best-effort)
+  if (req.method === "POST" && req.url === "/targets/ssh-setup") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", async () => {
+      let input;
+      try {
+        input = JSON.parse(body);
+      } catch {
+        res.writeHead(400);
+        res.end("Invalid JSON");
+        return;
+      }
+      const { domain, sshHost, sshUser, sshPath, sshPort = 22, sshPrivateKey, publicUrl } = input;
+      const missing = ["domain", "sshHost", "sshUser", "sshPath", "sshPrivateKey"].filter(
+        (k) => !input[k]
+      );
+      if (missing.length > 0) {
+        res.writeHead(400);
+        res.end(`Missing field(s): ${missing.join(", ")}`);
+        return;
+      }
+      // sshHost / sshUser / sshPath / sshPort are interpolated into shell
+      // commands (ssh-keyscan, rsync) — constrain them to safe shapes.
+      const invalid =
+        /^[A-Za-z0-9.\-:]+$/.test(sshHost) === false
+          ? "sshHost"
+          : /^[A-Za-z0-9._\-]+$/.test(sshUser) === false
+            ? "sshUser"
+            : /^[A-Za-z0-9._/\-]+$/.test(sshPath) === false
+              ? "sshPath"
+              : Number.isInteger(Number(sshPort)) === false ||
+                  Number(sshPort) < 1 ||
+                  Number(sshPort) > 65535
+                ? "sshPort"
+                : undefined;
+      if (invalid !== undefined) {
+        res.writeHead(400);
+        res.end(`Invalid ${invalid}`);
+        return;
+      }
+      if (publicUrl && /^https:\/\/[^\s"']+$/.test(publicUrl) === false) {
+        res.writeHead(400);
+        res.end("Invalid publicUrl (expected https://…)");
+        return;
+      }
+      try {
+        const workDir = join(WORK_DIR, domain);
+        await mkdir(workDir, { recursive: true });
+
+        const keyPath = join(workDir, "ssh_key");
+        await writeFile(
+          keyPath,
+          sshPrivateKey.endsWith("\n") ? sshPrivateKey : sshPrivateKey + "\n",
+          "utf8"
+        );
+        await chmod(keyPath, 0o600);
+
+        await writeFile(
+          join(workDir, "target.json"),
+          JSON.stringify(
+            { sshHost, sshUser, sshPath, sshPort: Number(sshPort), publicUrl: publicUrl ?? null },
+            null,
+            2
+          ) + "\n",
+          "utf8"
+        );
+
+        // Pre-seed known_hosts so the first rsync does not have to trust blindly.
+        try {
+          const { stdout } = await execAsync(`ssh-keyscan -p ${sshPort} -H ${sshHost}`, {
+            maxBuffer: 1024 * 1024,
+          });
+          if (stdout.trim()) {
+            await writeFile(join(workDir, "known_hosts"), stdout, "utf8");
+          }
+        } catch {
+          log(`ssh-keyscan failed for ${sshHost} — first publish will trust the host key on contact`);
+        }
+
+        log(`Configured SSH target for ${domain}: ${sshUser}@${sshHost}:${sshPath}`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true }));
+      } catch (error) {
+        logErr(`ssh-setup failed for ${input.domain}: ${error.message}`);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: error.message }));
+      }
+    });
+    return;
+  }
+
   if (req.method === "POST" && req.url === "/unpublish") {
     let body = "";
     req.on("data", (chunk) => (body += chunk));
@@ -1404,7 +1614,7 @@ const server = createServer(async (req, res) => {
         // `cloudflare` kept for builder images predating `targets`.
         cloudflare: !!(CF_API_TOKEN && CF_ACCOUNT_ID),
         coolify: false,
-        ssh: false,
+        ssh: true,
         // `${renderMode}:${host}` pairs this publisher can run right now.
         targets: availableTargets(),
       })

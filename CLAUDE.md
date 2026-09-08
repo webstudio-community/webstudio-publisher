@@ -20,13 +20,13 @@ Une cible de publication = deux axes orthogonaux dans le body du `POST /publish`
 | `ssg` | `local` | `publishBuild` — Vite prerender → `/var/publish/<host>/` | ✅ |
 | `ssr` | `local` | `publishBuildSsr` — `docker build` + `docker run` par domaine | ✅ |
 | `ssg` | `cloudflare` | `publishBuildCloudflare` — `wrangler pages deploy` | ✅ (si `CLOUDFLARE_*`) |
-| `ssg` | `ssh` | rsync vers serveur distant | 🔜 `501` — self-host#7 |
+| `ssg` | `ssh` | `publishBuildSsh` — `rsync` de l'output SSG vers un serveur distant | ✅ (cible par domaine via `POST /targets/ssh-setup`) |
 | `ssr` | `coolify` | app Coolify distante | 🔜 `501` — self-host#23 |
 | `ssg` | `coolify` | app Coolify distante (nginx) | 🔜 `501` — self-host#24 |
 
 Le mapping request → pipeline vit dans `RENDER_HOSTS` / `normalizeTarget` / `availableTargets`
 (section « Publish target » de `server.mjs`). En interne, `state.json.mode` vaut
-`docker` (pour `ssr`) ou `cloudflare` — un site SSG local n'écrit pas de `state.json`.
+`docker` (pour `ssr`), `cloudflare` ou `ssh` — un site SSG local n'écrit pas de `state.json`.
 
 **Champ `buildMode` hérité** — toujours accepté (CLI `webstudio` npm upstream, anciennes
 images builder). Mapping : `ssg` → `ssg`/`local`, `ssr` → `ssr`/`local`,
@@ -43,7 +43,7 @@ POST /publish { buildId, builderOrigin, buildMode: "ssr" }
   → webstudio build --template docker
   → écriture de DOCKER_SITE_DOCKERFILE dans workDir/Dockerfile
   → DOCKER_BUILDKIT=1 docker build -t <ws-domain> .   ← une seule fois
-  → docker stop/rm <container> ; docker run -p PORT:3000 -d --restart=unless-stopped
+  → docker stop/rm <container> ; docker run -d --restart=unless-stopped --network=$DOCKER_NETWORK
   → docker image prune -f
   → state.json { mode: "docker", imageName, containerName, publishDomain, customDomains }
   → tous les hostnames (publishDomain + customDomains) enregistrés dans dockerHostContainer
@@ -52,8 +52,8 @@ POST /publish { buildId, builderOrigin, buildMode: "ssr" }
 **Infra requise** : monter `/var/run/docker.sock` dans le container publisher.
 Un warning est loggé au démarrage si le socket n'est pas accessible.
 
-**Ports** : range `DOCKER_PORT_BASE+1…` (défaut 6001+).
-Un seul container par domaine — tous les custom domains sont proxiés vers le même port.
+Un seul container par domaine (nom = `ws-<slug>`), joignable par le proxy sur
+`<container>:3000` via `DOCKER_NETWORK` — pas de mapping de port publié.
 
 **Optimisations** (`DOCKER_SITE_DOCKERFILE`) :
 - Build multi-stage : prod deps uniquement dans l'image finale
@@ -72,6 +72,39 @@ POST /publish { buildId, builderOrigin, buildMode: "ssg" }
   → cp dist/client → /var/publish/<domain>/ (+ une copie par custom domain,
     réécrite vers l'origine de ce domaine)
 ```
+
+Les étapes `sync → build → vite build → réécriture URLs` sont extraites dans
+`buildSsgOutput()` (retourne `dist/client/`), partagé avec le mode `ssh`.
+
+### `ssh` — SSG sur un serveur distant
+
+Config **une fois par domaine** (la clé privée n'est pas renvoyée à chaque publish) :
+
+```
+POST /targets/ssh-setup
+  { domain, sshHost, sshUser, sshPath, sshPort?, sshPrivateKey, publicUrl? }
+  → /var/work/<domain>/ssh_key      (chmod 600, jamais loggée)
+  → /var/work/<domain>/target.json  { sshHost, sshUser, sshPath, sshPort, publicUrl }
+  → /var/work/<domain>/known_hosts  (ssh-keyscan, best-effort)
+```
+
+Publish :
+
+```
+POST /publish { buildId, renderMode: "ssg", host: "ssh" }
+  → lecture target.json (échec net + commande curl si absente)
+  → arrêt de ce qui servait le site localement (container / route CF / Traefik) + purge /var/publish/<hostnames>
+  → buildSsgOutput()  (origine = publicUrl ?? 1er custom domain ?? hostname wstd)
+  → rsync -az --delete -e "ssh -i ssh_key -o UserKnownHostsFile=known_hosts -o StrictHostKeyChecking=accept-new" dist/client/ user@host:path/
+  → state.json { mode: "ssh", publishDomain, customDomains, sshHost, sshPath, publicUrl }
+```
+
+Le publisher **ne sert pas** le site et n'écrit **aucune** config Traefik — TLS +
+routing sur le serveur distant sont à la charge de l'utilisateur. `unpublish`
+oublie le site localement ; les fichiers distants sont laissés en place.
+
+Image : `rsync` + `openssh-client` (+ `curl` + `jq` pour appeler l'API depuis
+`docker compose exec`) ajoutés au `Dockerfile`.
 
 ### `cloudflare` — Cloudflare Pages
 
@@ -142,9 +175,9 @@ Un domaine servi par un runtime écrit `/var/work/<domain>/state.json` :
 ```json
 { "mode": "docker", "imageName": "ws-mysite", "containerName": "ws-mysite", "publishDomain": "mysite.wstd.work", "customDomains": [] }
 ```
-`mode` ∈ `docker` | `cloudflare`. Un site SSG local n'écrit pas de `state.json` (les fichiers sur disque suffisent).
+`mode` ∈ `docker` | `cloudflare` | `ssh`. Un site SSG local n'écrit pas de `state.json` (les fichiers sur disque suffisent).
 
-Au démarrage, `restoreTargets()` relit tous les `state.json` : les containers Docker sont (re)démarrés, les routes de staging Cloudflare ré-enregistrées. SSG n'a rien à restaurer.
+Au démarrage, `restoreTargets()` relit tous les `state.json` : les containers Docker sont (re)démarrés, les routes de staging Cloudflare ré-enregistrées. SSG et SSH n'ont rien à restaurer.
 
 ## Variables d'environnement
 

@@ -42,5 +42,27 @@ docker build -t webstudio-publisher .
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/publish` | Trigger a publish. Body: `{ "buildId": "...", "builderOrigin": "..." }` |
+| `POST` | `/publish` | Trigger a publish. Body: `{ "buildId", "builderOrigin", "renderMode": "ssg" \| "ssr", "host": "local" \| "cloudflare" \| "ssh" }` (legacy `"buildMode": "ssg" \| "ssr" \| "cloudflare"` still accepted) |
+| `POST` | `/targets/ssh-setup` | Configure the SSH target for a domain (`host: "ssh"`). Body: `{ "domain", "sshHost", "sshUser", "sshPath", "sshPort"?, "sshPrivateKey", "publicUrl"? }` |
+| `POST` | `/unpublish` | Take a hostname down. Body: `{ "domain": "..." }` |
+| `GET` | `/capabilities` | Publisher capabilities — `{ "cloudflare": bool, "coolify": bool, "ssh": bool, "targets": ["ssg:local", …] }` |
 | `GET` | `/health` | Health check — returns `ok` |
+
+### `host: "ssh"` — deploy an SSG site to a remote server
+
+Configure the target once, then publish with `renderMode: "ssg"`, `host: "ssh"`:
+
+```bash
+# 1. generate a keypair and authorize it on the remote server
+ssh-keygen -t ed25519 -f ./ws_deploy -N ''
+ssh-copy-id -i ./ws_deploy.pub deploy@my-server
+
+# 2. register the target with the publisher (once per site)
+curl -X POST http://publisher:4000/targets/ssh-setup \
+  -H 'content-type: application/json' \
+  -d "{\"domain\":\"my-site\",\"sshHost\":\"my-server\",\"sshUser\":\"deploy\",\"sshPath\":\"/var/www/my-site\",\"sshPrivateKey\":\"$(awk '{printf "%s\\n", $0}' ./ws_deploy)\",\"publicUrl\":\"https://my-site.com\"}"
+```
+
+Each publish runs `rsync -az --delete` from the freshly built `dist/client/` to
+`sshUser@sshHost:sshPath/`. TLS and web-server config on the remote host are the
+user's responsibility; the publisher does not serve the site or manage its domain.
