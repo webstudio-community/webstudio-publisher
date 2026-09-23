@@ -1040,6 +1040,36 @@ const toDockerName = (domain) =>
     .replace(/^-+|-+$/g, "");
 
 /**
+ * react-router.config.ts for a generated SSR site.
+ *
+ * React Router 7 rejects an action request (form submit) with a 400 when the
+ * browser's `Origin` header does not match `request.url`. Behind the TLS-
+ * terminating proxy the site container only ever sees plain http, so every
+ * https form submission looks like a cross-origin request and is refused —
+ * the Webhook Form then fails on every self-hosted SSR site.
+ *
+ * `allowedActionOrigins` whitelists the hostnames the site is published on.
+ * Hostnames are checked before being written into generated code, and no
+ * wildcard is used so the CSRF check stays on for every other origin.
+ */
+const HOSTNAME_RE = /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/;
+
+const buildReactRouterConfig = (hostnames) => {
+  const allowed = [];
+  for (const hostname of hostnames) {
+    const normalized = String(hostname).trim().toLowerCase();
+    if (HOSTNAME_RE.test(normalized) === false) {
+      logErr(`Skipping invalid hostname in allowedActionOrigins: ${hostname}`);
+      continue;
+    }
+    if (allowed.includes(normalized) === false) {
+      allowed.push(normalized);
+    }
+  }
+  return `export default {\n  allowedActionOrigins: ${JSON.stringify(allowed)},\n};\n`;
+};
+
+/**
  * Sync the build, generate the react-router-docker project, and produce a
  * Docker image tagged `imageTag` in the local daemon. Shared by the local SSR
  * pipeline (publishBuildSsr → `docker run`) and the remote Coolify pipeline
@@ -1050,10 +1080,17 @@ const toDockerName = (domain) =>
  *   2. webstudio build --template docker
  *   2b. patch [_image].$.ts (ipx storage + disk cache)
  *   2c. write patch-navlink.cjs (run inside the build)
+ *   2d. write react-router.config.ts (allowedActionOrigins = site hostnames)
  *   3. write DOCKER_SITE_DOCKERFILE
  *   4. docker build -t <imageTag> .
  */
-const buildDockerImage = async ({ buildId, domain, workDir, imageTag }) => {
+const buildDockerImage = async ({
+  buildId,
+  domain,
+  workDir,
+  imageTag,
+  hostnames = [],
+}) => {
   const run = async (cmd, extraEnv = {}) => {
     log(`  $ ${cmd}`);
     const { stdout, stderr } = await execAsync(cmd, {
@@ -1131,6 +1168,14 @@ if (patched !== c) {
 }
 `);
 
+  // 2d. Allow form submissions from the hostnames this site is served on.
+  await writeFile(
+    join(workDir, "react-router.config.ts"),
+    buildReactRouterConfig(hostnames),
+    "utf8"
+  );
+  log(`Wrote react-router.config.ts for ${domain}`);
+
   // 3. Write optimized multi-stage Dockerfile (BuildKit cache mounts)
   await writeFile(join(workDir, "Dockerfile"), DOCKER_SITE_DOCKERFILE, "utf8");
   log(`Wrote Dockerfile for ${domain}`);
@@ -1192,7 +1237,13 @@ const publishBuildSsr = async ({ buildId }) => {
   } catch { /* no state.json — new domain */ }
 
   const imageName = toDockerName(domain);
-  await buildDockerImage({ buildId, domain, workDir, imageTag: imageName });
+  await buildDockerImage({
+    buildId,
+    domain,
+    workDir,
+    imageTag: imageName,
+    hostnames: [publishDomain, ...customDomains],
+  });
 
   // Stop/remove old container + start fresh one on the shared Docker network
   const containerName = imageName;
@@ -1384,7 +1435,13 @@ const publishBuildCoolifySsr = async ({
   await stopLocalServing({ domain, stateFile, publishDomain, customDomains });
 
   const imageRepo = `${REGISTRY_URL}/${toDockerName(domain)}`;
-  await buildDockerImage({ buildId, domain, workDir, imageTag: `${imageRepo}:latest` });
+  await buildDockerImage({
+    buildId,
+    domain,
+    workDir,
+    imageTag: `${imageRepo}:latest`,
+    hostnames: [publishDomain, ...customDomains],
+  });
   await deployImageToCoolify({
     imageRepo,
     buildId,
