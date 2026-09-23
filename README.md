@@ -69,6 +69,18 @@ Each publish runs `rsync -az --delete` from the freshly built `dist/client/` to
 `sshUser@sshHost:sshPath/`. TLS and web-server config on the remote host are the
 user's responsibility; the publisher does not serve the site or manage its domain.
 
+### SSR form submissions and allowed origins
+
+React Router 7 refuses a form submission (`POST`) whose `Origin` header does not
+match the URL it sees, and behind the TLS-terminating proxy the site container
+only sees plain `http`. For every SSR site (`host: "local"` and `"coolify"`) the
+publisher therefore writes a `react-router.config.ts` with
+`allowedActionOrigins` set to the site's hostnames (the staging domain + its
+custom domains). Without it, every Webhook Form on the site answers `400`.
+
+The list is fixed at build time: a custom domain added after a publish only
+accepts form submissions after the next publish. Other origins stay rejected.
+
 ### `host: "coolify"` — deploy to a remote Coolify (SSR or SSG)
 
 Set `REGISTRY_URL` (+ `REGISTRY_USER` / `REGISTRY_TOKEN` if private) on the
