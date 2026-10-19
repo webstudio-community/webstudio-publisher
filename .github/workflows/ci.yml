@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Syntaxe
+        run: node --check server.mjs
+      - name: Démarrage + /health
+        run: |
+          PORT=4000 PROXY_PORT=4001 node server.mjs > "$RUNNER_TEMP/server.log" 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          for _ in $(seq 1 20); do
+            if [ "$(curl -fsS -m 2 http://127.0.0.1:4000/health 2>/dev/null)" = ok ]; then
+              echo "health ok"; exit 0
+            fi
+            kill -0 $pid 2>/dev/null || break
+            sleep 1
+          done
+          echo "::error::le publisher ne répond pas sur /health"
+          cat "$RUNNER_TEMP/server.log"
+          exit 1
+
+  dockerfile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: hadolint (erreurs uniquement)
+        run: docker run --rm -i hadolint/hadolint:v2.12.0 hadolint --failure-threshold error - < Dockerfile
+
+  workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pipx install yamllint==1.35.1
+      - run: yamllint -c .yamllint.yml .github
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -color

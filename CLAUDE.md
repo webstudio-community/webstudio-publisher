@@ -318,3 +318,10 @@ surchargeable via `--build-arg WEBSTUDIO_SDK_VERSION=x.y.z`. N'affecte PAS la co
 sync/build (celle-ci dépend du schéma, pas de la chaîne de version) — fixe seulement
 quel **SDK runtime** publié les sites générés téléchargent. Deux axes distincts :
 le CLI suit le commit du builder, le SDK runtime suit la dernière version npm.
+
+## CI
+
+`.github/workflows/ci.yml` (PR, push `main`) : `server` (`node --check server.mjs` puis démarrage réel + `GET /health` sur le port 4000), `dockerfile` (hadolint, erreurs uniquement) et `workflows` (yamllint + actionlint sur `.github`). Le build d'image reste couvert par `docker-publish.yml`, qui tourne aussi sur les PR.
+
+- Le smoke test ne lance aucune publication : il valide que le fichier unique `server.mjs` se charge et écoute (une erreur de syntaxe ou d'import au top-level casserait le publisher en prod sans autre signal avant le déploiement).
+- Une nouvelle variable d'environnement **obligatoire** au démarrage doit recevoir une valeur dans l'étape « Démarrage + /health » du workflow.
