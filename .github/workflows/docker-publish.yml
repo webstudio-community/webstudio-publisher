@@ -81,6 +81,7 @@ jobs:
         env:
           BUILDER_REF: ${{ inputs.builder_ref }}
           IMAGE_TAG: ${{ inputs.image_tag }}
+          HEAD_REF: ${{ github.head_ref }}
         run: |
           sanitize() {
             echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/-\+/-/g' | sed 's/^-//;s/-$//'
@@ -88,7 +89,7 @@ jobs:
 
           # For PR events GITHUB_REF_NAME is "N/merge" — use head_ref instead
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            BRANCH="${{ github.head_ref }}"
+            BRANCH="$HEAD_REF"
           else
             BRANCH="${GITHUB_REF_NAME}"
           fi
