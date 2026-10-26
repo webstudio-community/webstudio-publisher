@@ -47,6 +47,11 @@ const execAsync = promisify(exec);
 
 const PORT = process.env.PORT ?? "4000";
 const PROXY_PORT = process.env.PROXY_PORT ?? "4001";
+// Max publishes running at the same time across all domains (0 = unlimited).
+const MAX_CONCURRENT_PUBLISHES = Math.max(
+  0,
+  Number.parseInt(process.env.MAX_CONCURRENT_PUBLISHES ?? "0", 10) || 0
+);
 const SERVICE_TOKEN = process.env.TRPC_SERVER_API_TOKEN ?? "";
 const PUBLISHER_HOST = process.env.PUBLISHER_HOST ?? "";
 const CF_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN ?? "";
@@ -219,6 +224,30 @@ const tryServeStaticFile = async (req, res, host) => {
 
 /** Serialize publish jobs per domain to avoid concurrent builds. */
 const projectQueues = new Map();
+
+/**
+ * Global limit on simultaneous publishes (MAX_CONCURRENT_PUBLISHES, 0 = unlimited).
+ * Excess jobs wait in FIFO order until a slot frees up.
+ */
+let activePublishes = 0;
+const publishWaiters = [];
+
+const acquirePublishSlot = async () => {
+  if (MAX_CONCURRENT_PUBLISHES === 0) return;
+  if (activePublishes >= MAX_CONCURRENT_PUBLISHES) {
+    // the releasing job hands its slot over, so the count stays unchanged
+    await new Promise((resolve) => publishWaiters.push(resolve));
+    return;
+  }
+  activePublishes += 1;
+};
+
+const releasePublishSlot = () => {
+  if (MAX_CONCURRENT_PUBLISHES === 0) return;
+  const next = publishWaiters.shift();
+  if (next) next();
+  else activePublishes -= 1;
+};
 
 const getProjectQueue = (domain) => {
   const existing = projectQueues.get(domain);
@@ -1917,14 +1946,19 @@ const server = createServer(async (req, res) => {
       const q = getProjectQueue(tempDomainKey);
 
       q.current = q.current
-        .then(() =>
-          runner({
-            buildId,
-            builderOrigin,
-            coolifyWebhookUrl: input.coolifyWebhookUrl,
-            coolifyWebhookToken: input.coolifyWebhookToken,
-          })
-        )
+        .then(async () => {
+          await acquirePublishSlot();
+          try {
+            await runner({
+              buildId,
+              builderOrigin,
+              coolifyWebhookUrl: input.coolifyWebhookUrl,
+              coolifyWebhookToken: input.coolifyWebhookToken,
+            });
+          } finally {
+            releasePublishSlot();
+          }
+        })
         .then(() => notifyBuildStatus(buildId, "PUBLISHED"))
         .catch((err) => {
           logErr(`Publish failed for build ${buildId}: ${err.message}`);

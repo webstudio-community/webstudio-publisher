@@ -206,7 +206,7 @@ la map `cfProjectHost` (hostname de staging → nom de projet), remplie à la pu
 et restaurée au démarrage depuis `state.json`. Un custom domain n'y entre jamais : son
 DNS pointe directement sur Cloudflare et ne repasse pas par le publisher.
 
-Les jobs sont sérialisés **par domaine** via une queue de promesses (`projectQueues`).
+Les jobs sont sérialisés **par domaine** via une queue de promesses (`projectQueues`), puis limités globalement par `MAX_CONCURRENT_PUBLISHES` (sémaphore `acquirePublishSlot`/`releasePublishSlot`).
 
 ## Proxy de sites (port PROXY_PORT)
 
@@ -238,6 +238,7 @@ Au démarrage, `restoreTargets()` relit tous les `state.json` : les containers D
 | `TRAEFIK_DYNAMIC_DIR` | Si défini, écrit les configs Traefik pour les domaines custom |
 | `PORT` | Port de l'API build (défaut: 4000) |
 | `PROXY_PORT` | Port du proxy de sites (défaut: 4001) |
+| `MAX_CONCURRENT_PUBLISHES` | Nb max de publications simultanées, tous domaines confondus (défaut: 0 = illimité ; file FIFO au-delà) |
 | `CLOUDFLARE_API_TOKEN` | Token Wrangler pour deploy CF Pages (mode `cloudflare`) |
 | `CLOUDFLARE_ACCOUNT_ID` | ID compte Cloudflare (mode `cloudflare`) |
 | `CLOUDFLARE_PRODUCTION_BRANCH` | Branche de production des projets Pages créés (défaut: `main`) |
