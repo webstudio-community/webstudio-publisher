@@ -31,6 +31,7 @@ for the full Docker Compose setup.
 | `BUILDER_INTERNAL_URL` | `http://app:3000` | Internal Docker URL for the builder (avoids Traefik/TLS) |
 | `PUBLISHER_HOST` | — | Domain suffix for slug-based URLs (e.g. `example.com` → `myproject.example.com`) |
 | `PORT` | `4000` | HTTP port |
+| `MAX_CONCURRENT_PUBLISHES` | `0` (unlimited) | Max publishes running at once across all sites; extra ones wait in a FIFO queue. Set to `1` on small machines (e.g. Raspberry Pi) |
 | `REGISTRY_URL` | — | Registry to push images to for `host: "coolify"` (e.g. `ghcr.io/my-org`) — enables the `ssr:coolify` and `ssg:coolify` targets |
 | `REGISTRY_USER` / `REGISTRY_TOKEN` | — | Registry write credentials (if private) |
 
