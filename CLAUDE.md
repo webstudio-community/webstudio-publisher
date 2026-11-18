@@ -263,63 +263,30 @@ docker build -t webstudio-publisher .
 # Image publiée sur : ghcr.io/webstudio-community/webstudio-publisher
 ```
 
-### CLI webstudio ↔ lockstep avec le builder (IMPORTANT)
+### CLI webstudio — servi par le builder (IMPORTANT)
 
-Le handshake `webstudio sync` est verrouillé par un **hash de contrat de bundle** +
-la surface des routes tRPC, tous deux dérivés du schéma du **fork**. Le CLI publié
-sur npm (`webstudio@latest`) est buildé depuis le schéma **upstream** → rejeté par
-l'API du fork (`apiCompatibilityError`).
+Le handshake `webstudio sync` est verrouillé par un hash de contrat de bundle + la
+surface des routes tRPC, dérivés du schéma du **fork**. Le CLI npm upstream
+(`webstudio@latest`) est rejeté par l'API du fork (`apiCompatibilityError`).
 
-→ Le `Dockerfile` **build donc le CLI depuis le fork** (stage `cli-build`), au commit
-passé via `--build-arg WEBSTUDIO_REF`. Le CI (`docker-publish.yml`) lit le label
-`org.opencontainers.image.revision` de `ghcr.io/webstudio-community/builder:latest`
-et l'utilise comme ref → le CLI du publisher est toujours au **même commit que le
-builder déployé**. Ne jamais revenir à `npm install -g webstudio@latest`.
+→ Chaque builder sert son propre CLI (build depuis son commit) sur `/npm/`
+(webstudio-fork#88, paquet `@webstudio-community/cli`). Le publisher **n'embarque
+plus de CLI** : `server.mjs` lance `WEBSTUDIO_CLI`, soit
+`npx --yes --@webstudio-community:registry=${BUILDER_INTERNAL_URL}/npm/ @webstudio-community/cli <sync|build …>`.
+`npx` compare `dist-tags.latest` à chaque run → un builder redéployé est pris en
+compte au publish suivant, sans rebuild de l'image publisher.
 
-**Tester une branche builder non mergée** : `docker-publish.yml` accepte trois inputs
-de `workflow_dispatch` — `builder_ref` (branche/tag/commit du fork, court-circuite la
-lecture du label), `image_tag` (optionnel, défaut `builder-<ref>`) et `nonce`
-(optionnel, marqueur repris dans le `run-name` pour qu'un dispatcher automatique
-retrouve le run). Une image ainsi
-pinnée n'est **jamais** taguée `:latest`, même dispatchée depuis `main` : c'est le
-rôle de la sortie `pinned` du step « Compute branch tag », car `github.ref` vaut
-`refs/heads/main` sur un dispatch depuis `main` et suffirait sinon à écraser `:latest`.
-
-Depuis le fork, **chaque PR interne déclenche ce dispatch automatiquement** (job
-`publisher-test-image` de `docker-publish.yml` côté fork) : `builder_ref` = la branche
-de la PR, `nonce` = `pr<N>-<run_id>-<attempt>`. Le fork attend la fin du build puis
-poste/édite un commentaire unique dans la PR avec les deux refs d'images
-(`builder:<branche>` + `webstudio-publisher:builder-<branche>`). À la fermeture de la
-PR, le `docker-cleanup.yml` du fork dispatche celui d'ici (input `tag`) pour supprimer
-l'image de test.
-
-`builder_ref` est résolu en **SHA** via `git ls-remote` avant le build : le stage
-`cli-build` cache `git checkout "$WEBSTUDIO_REF"` sur une couche keyée par la valeur
-littérale de l'ARG, donc re-dispatcher la **même branche** après un nouveau commit
-réutiliserait un checkout périmé si on passait le nom de branche tel quel.
-
-```bash
-gh workflow run docker-publish.yml --repo webstudio-community/webstudio-publisher \
-  -f builder_ref=<branche-du-fork>
-```
-
-C'est indispensable dès qu'un sync upstream déplace le `bundleVersion` : le builder
-rebasé et le CLI du publisher doivent être buildés depuis le **même** commit, sinon
-`assertCliBundleVersion` rejette le publish (`Project bundle format is incompatible`).
-
-### Version des packages `@webstudio-is/*` stampée (`WEBSTUDIO_SDK_VERSION`)
-
-Buildé depuis les sources, le CLI garde le placeholder `0.0.0-webstudio-version`.
-Les sites générés déclareraient alors `@webstudio-is/*@0.0.0-webstudio-version` →
-`npm install` échoue (`ETARGET`, version inexistante sur npm).
-
-→ Le stage `cli-build` **remplace** ce placeholder par une vraie version publiée
-dans tous les `package.json` (même étape que `release.yml` du fork), avant install.
-Par défaut = `npm view webstudio@latest version` (résolu à chaque build d'image),
-surchargeable via `--build-arg WEBSTUDIO_SDK_VERSION=x.y.z`. N'affecte PAS la compat
-sync/build (celle-ci dépend du schéma, pas de la chaîne de version) — fixe seulement
-quel **SDK runtime** publié les sites générés téléchargent. Deux axes distincts :
-le CLI suit le commit du builder, le SDK runtime suit la dernière version npm.
+- Cache `npx` : `NPM_CONFIG_CACHE=/var/work/.npm-cache` (volume `publisher-work`,
+  surchargeable par la variable d'environnement). Le 1er publish après une mise à jour
+  du builder est plus lent (téléchargement du paquet).
+- Le publisher dépend de la disponibilité du builder pour publier (déjà vrai pour
+  `sync`) ; si `/npm/` répond 404 (builder sans CLI packé), le publish échoue.
+- Ne jamais revenir à `npm install -g webstudio@latest`.
+- La version des packages `@webstudio-is/*` des sites générés est stampée côté builder
+  (`WEBSTUDIO_SDK_VERSION`, Dockerfile du builder, stage `cli`).
+- Reste à retirer (issue séparée dans le fork) : les inputs `builder_ref` / `image_tag` /
+  `nonce` de `docker-publish.yml`, la résolution du label `revision` du builder, le job
+  `publisher-test-image` côté fork et le dispatch de `docker-cleanup.yml`.
 
 ## CI
 
