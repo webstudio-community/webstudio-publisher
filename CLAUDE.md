@@ -284,9 +284,9 @@ compte au publish suivant, sans rebuild de l'image publisher.
 - Ne jamais revenir à `npm install -g webstudio@latest`.
 - La version des packages `@webstudio-is/*` des sites générés est stampée côté builder
   (`WEBSTUDIO_SDK_VERSION`, Dockerfile du builder, stage `cli`).
-- Reste à retirer (issue séparée dans le fork) : les inputs `builder_ref` / `image_tag` /
-  `nonce` de `docker-publish.yml`, la résolution du label `revision` du builder, le job
-  `publisher-test-image` côté fork et le dispatch de `docker-cleanup.yml`.
+- Plus de CI croisée : `docker-publish.yml` ne lit plus le label du builder et n'accepte
+  plus `builder_ref` / `image_tag` / `nonce`. Tester une branche builder = déployer son
+  image `builder:<branche>` : son CLI est servi par `/npm/`, aucune image publisher dédiée.
 
 ## CI
 
