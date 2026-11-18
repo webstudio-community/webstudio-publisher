@@ -70,6 +70,12 @@ const REGISTRY_TOKEN = process.env.REGISTRY_TOKEN ?? "";
 const BUILDER_INTERNAL_URL = process.env.BUILDER_INTERNAL_URL ?? "http://app:3000";
 const PUBLISH_DIR = "/var/publish";
 const WORK_DIR = "/var/work";
+// The webstudio CLI is served by the builder itself (its /npm/ registry), so it is
+// always built from the same commit as the builder — no lockstep with this image.
+// npx compares dist-tags.latest on every run: a redeployed builder is picked up
+// immediately. The npx cache lives in the work volume so it survives restarts.
+process.env.NPM_CONFIG_CACHE ??= join(WORK_DIR, ".npm-cache");
+const WEBSTUDIO_CLI = `npx --yes --@webstudio-community:registry=${BUILDER_INTERNAL_URL.replace(/\/+$/, "")}/npm/ @webstudio-community/cli`;
 // When set, the publisher writes a per-domain Traefik dynamic config file so
 // Traefik can request a Let's Encrypt certificate for each custom domain.
 // Mount /data/coolify/proxy/dynamic into the container and set this to that path.
@@ -734,12 +740,12 @@ const publishBuildCloudflare = async ({ buildId }) => {
   // 1. Sync build data
   log(`Syncing build data for ${domain}...`);
   await run(
-    `webstudio sync --buildId=${buildId} --origin=${BUILDER_INTERNAL_URL} --authToken=${SERVICE_TOKEN}`
+    `${WEBSTUDIO_CLI} sync --buildId=${buildId} --origin=${BUILDER_INTERNAL_URL} --authToken=${SERVICE_TOKEN}`
   );
 
   // 2. Generate Cloudflare project code
   log(`Generating Cloudflare code for ${domain}...`);
-  await run(`webstudio build --template cloudflare`);
+  await run(`${WEBSTUDIO_CLI} build --template cloudflare`);
 
   // 3. Install npm dependencies (first publish, or after a template switch).
   //
@@ -832,7 +838,7 @@ const buildSsgOutput = async ({ buildId, domain, workDir, publicOrigin }) => {
   // 1. Sync build data (via URL interne Docker, pas besoin de passer par Traefik/TLS)
   log(`Syncing build data for ${domain}...`);
   await run(
-    `webstudio sync --buildId=${buildId} --origin=${BUILDER_INTERNAL_URL} --authToken=${SERVICE_TOKEN}`
+    `${WEBSTUDIO_CLI} sync --buildId=${buildId} --origin=${BUILDER_INTERNAL_URL} --authToken=${SERVICE_TOKEN}`
   );
 
   // 2. Generate SSG project code (copies template + generates pages)
@@ -840,7 +846,7 @@ const buildSsgOutput = async ({ buildId, domain, workDir, publicOrigin }) => {
   log(`Generating SSG code for ${domain}...`);
   await rm(join(workDir, "pages"), { recursive: true, force: true });
   await rm(join(workDir, "app"), { recursive: true, force: true });
-  await run(`webstudio build --template ssg`);
+  await run(`${WEBSTUDIO_CLI} build --template ssg`);
 
   // 2b. Pin vike to the exact version the SSG template targets.
   const TARGET_VIKE = "0.4.229";
@@ -1211,12 +1217,12 @@ const buildDockerImage = async ({
   // 1. Sync build data
   log(`Syncing build data for ${domain}...`);
   await run(
-    `webstudio sync --buildId=${buildId} --origin=${BUILDER_INTERNAL_URL} --authToken=${SERVICE_TOKEN}`
+    `${WEBSTUDIO_CLI} sync --buildId=${buildId} --origin=${BUILDER_INTERNAL_URL} --authToken=${SERVICE_TOKEN}`
   );
 
   // 2. Generate Docker project code (react-router-docker template)
   log(`Generating Docker code for ${domain}...`);
-  await run(`webstudio build --template docker`);
+  await run(`${WEBSTUDIO_CLI} build --template docker`);
 
   // 2b. Patch [_image].$.ts:
   //   - Fix storage root: template uses "./public" but Vite moves assets into
