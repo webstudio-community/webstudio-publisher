@@ -250,6 +250,7 @@ Au démarrage, `restoreTargets()` relit tous les `state.json` : les containers D
 - `BUILDER_INTERNAL_URL` évite de passer par Traefik/TLS depuis le container
 - Le patch `patchDataFilesForPrerender` corrige un bug vike où `pageContext.headers` est vide au build time
 - vike est épinglé à `TARGET_VIKE` (constante dans le code) — ne pas changer sans tester
+- rollup est forcé à `PINNED_ROLLUP` via `overrides` dans le `package.json` généré (`pinSiteDependencies`, avant tout `npm install`/`docker build`) : rollup 4.68.6 casse le parse natif musl (« Code is nested too deeply ») et tous les builds tournent sur Alpine. À retirer dès qu'une version corrigée sort
 - Les custom domains (contenant un `.`) reçoivent une config Traefik auto-générée pour Let's Encrypt
 - Le nom de projet CF Pages est dérivé du domain (sanitisé en `[a-z0-9-]+`, max 58 chars)
 - Transition SSG→SSR : les `node_modules` sont forcément réinstallés (templates incompatibles)

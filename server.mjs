@@ -478,6 +478,30 @@ const dockerHostContainer = new Map();
 // goes through this map, its DNS points straight at Cloudflare.
 const cfProjectHost = new Map();
 
+// ─── Generated site package.json: dependency pins ────────────────────────────
+
+// rollup 4.68.6 (rollup/rollup#6669) throws "Code is nested too deeply" on
+// trivial files (e.g. react-dom/client.js) with its musl native binding. Every
+// site build runs on node:22-alpine, so every vite build fails. glibc is fine.
+// Remove once a fixed rollup release is out.
+const PINNED_ROLLUP = "4.68.5";
+
+/**
+ * Force transitive deps of the generated site to known-good versions via npm
+ * `overrides`. Must run before any `npm install` / `npm ci` on the workDir —
+ * in the Docker pipeline the changed package.json also busts the cached
+ * `npm install --package-lock-only` layer.
+ */
+const pinSiteDependencies = async (workDir) => {
+  const packageJsonPath = join(workDir, "package.json");
+  const pkg = JSON.parse(await readFile(packageJsonPath, "utf8"));
+  if (pkg.overrides?.rollup === PINNED_ROLLUP) return false;
+  pkg.overrides = { ...pkg.overrides, rollup: PINNED_ROLLUP };
+  await writeFile(packageJsonPath, JSON.stringify(pkg, null, 2) + "\n", "utf8");
+  log(`  Pinned rollup to ${PINNED_ROLLUP} (overrides) in package.json`);
+  return true;
+};
+
 // ─── Docker mode: site Dockerfile template ───────────────────────────────────
 
 // Multi-stage Dockerfile written into each domain's workDir before `docker build`.
@@ -739,6 +763,7 @@ const publishBuildCloudflare = async ({ buildId }) => {
     }
   }
   if (needsInstall) {
+    await pinSiteDependencies(workDir);
     log(`Installing dependencies for ${domain}...`);
     await run(`npm install`);
   }
@@ -875,6 +900,7 @@ const buildSsgOutput = async ({ buildId, domain, workDir, publicOrigin }) => {
 
   // 3. Install npm dependencies (first time, or after version pin change)
   if (needsInstall) {
+    await pinSiteDependencies(workDir);
     log(`Installing dependencies for ${domain}...`);
     await run(`npm install`);
   }
@@ -1255,6 +1281,9 @@ if (patched !== c) {
     "utf8"
   );
   log(`Wrote react-router.config.ts for ${domain}`);
+
+  // 2e. Pin known-bad transitive deps (rollup) before the image's npm install.
+  await pinSiteDependencies(workDir);
 
   // 3. Write optimized multi-stage Dockerfile (BuildKit cache mounts)
   await writeFile(join(workDir, "Dockerfile"), DOCKER_SITE_DOCKERFILE, "utf8");
