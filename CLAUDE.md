@@ -42,7 +42,7 @@ POST /publish { buildId, builderOrigin, buildMode: "ssr" }
   → webstudio sync --buildId --origin --authToken
   → webstudio build --template docker
   → écriture de react-router.config.ts (allowedActionOrigins = publishDomain + customDomains)
-  → écriture de patch-navlink.cjs + patch-webhook-form.cjs (lancés dans le docker build)
+  → écriture de patch-navlink.cjs (lancé dans le docker build : stage build pour le bundle client ET image finale pour les node_modules du serveur SSR)
   → écriture de DOCKER_SITE_DOCKERFILE dans workDir/Dockerfile
   → DOCKER_BUILDKIT=1 docker build -t <ws-domain> .   ← une seule fois
   → docker stop/rm <container> ; docker run -d --restart=unless-stopped --network=$DOCKER_NETWORK

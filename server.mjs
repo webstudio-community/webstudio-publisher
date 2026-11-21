@@ -552,6 +552,10 @@ COPY package.json /app/
 COPY --from=dependencies-env /app/node_modules /app/node_modules
 COPY --from=build-env /app/build /app/build
 WORKDIR /app
+# The SSR server imports @webstudio-is/* from these runtime node_modules (not
+# bundled), so patch them too — otherwise the server-rendered HTML keeps the bug.
+COPY patch-navlink.cjs /app/
+RUN node /app/patch-navlink.cjs
 # ipx serves optimized images for any host — baked in so a Coolify-hosted app
 # needs no manual env var (the local SSR pipeline also passes it via -e).
 ENV IPX_HTTP_ALLOW_ALL_DOMAINS=true
