@@ -32,6 +32,7 @@ for the full Docker Compose setup.
 | `PUBLISHER_HOST` | — | Domain suffix for slug-based URLs (e.g. `example.com` → `myproject.example.com`) |
 | `PORT` | `4000` | HTTP port |
 | `MAX_CONCURRENT_PUBLISHES` | `0` (unlimited) | Max publishes running at once across all sites; extra ones wait in a FIFO queue. Set to `1` on small machines (e.g. Raspberry Pi) |
+| `CONTAINER_READY_TIMEOUT_MS` | `60000` | SSR: max wait for a newly published container to answer before the publish fails and the previous version stays online |
 | `REGISTRY_URL` | — | Registry to push images to for `host: "coolify"` (e.g. `ghcr.io/my-org`) — enables the `ssr:coolify` and `ssg:coolify` targets |
 | `REGISTRY_USER` / `REGISTRY_TOKEN` | — | Registry write credentials (if private) |
 
