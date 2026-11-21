@@ -91,6 +91,18 @@ let OWN_CONTAINER_NAME = "";
 const log = (msg) => console.info(`[publisher] ${msg}`);
 const logErr = (msg) => console.error(`[publisher] ${msg}`);
 
+/**
+ * Mask known secrets in any text (command, stdout/stderr, error message) before logging it.
+ */
+const SECRETS = [
+  [SERVICE_TOKEN, "<REDACTED_BUILDER_TOKEN>"],
+  [CF_API_TOKEN, "<REDACTED_CF_TOKEN>"],
+  [REGISTRY_TOKEN, "<REDACTED_REGISTRY_TOKEN>"],
+].filter(([secret]) => secret);
+
+const redactSecrets = (text) =>
+  SECRETS.reduce((acc, [secret, mask]) => acc.replaceAll(secret, mask), String(text));
+
 // ─── Docker container management ─────────────────────────────────────────────
 
 /**
@@ -274,7 +286,7 @@ const getProjectBuildInfo = async (buildId) => {
   });
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`Failed to fetch build ${buildId}: ${text.slice(0, 500)}`);
+    throw new Error(`Failed to fetch build ${buildId}: ${redactSecrets(text.slice(0, 500))}`);
   }
   const wrapper = await response.json();
   const data = wrapper?.result?.data;
@@ -304,12 +316,12 @@ const notifyBuildStatus = async (buildId, publishStatus) => {
     });
     if (!response.ok) {
       const text = await response.text();
-      logErr(`notifyBuildStatus(${buildId}, ${publishStatus}) failed: ${text.slice(0, 200)}`);
+      logErr(`notifyBuildStatus(${buildId}, ${publishStatus}) failed: ${redactSecrets(text.slice(0, 200))}`);
     } else {
       log(`notifyBuildStatus(${buildId}, ${publishStatus}) OK`);
     }
   } catch (err) {
-    logErr(`notifyBuildStatus(${buildId}, ${publishStatus}) error: ${err.message}`);
+    logErr(`notifyBuildStatus(${buildId}, ${publishStatus}) error: ${redactSecrets(err.message)}`);
   }
 };
 
@@ -709,14 +721,14 @@ const publishBuildCloudflare = async ({ buildId }) => {
   await mkdir(workDir, { recursive: true });
 
   const run = async (cmd, extraEnv = {}) => {
-    log(`  $ ${cmd}`);
+    log(`  $ ${redactSecrets(cmd)}`);
     const { stdout, stderr } = await execAsync(cmd, {
       cwd: workDir,
       maxBuffer: 10 * 1024 * 1024,
       env: { ...process.env, ...extraEnv },
     });
-    if (stdout) log(`  stdout: ${stdout.trim()}`);
-    if (stderr) log(`  stderr: ${stderr.trim()}`);
+    if (stdout) log(`  stdout: ${redactSecrets(stdout.trim())}`);
+    if (stderr) log(`  stderr: ${redactSecrets(stderr.trim())}`);
   };
 
   // Handle mode transitions → cloudflare. Without this a site that was
@@ -740,7 +752,8 @@ const publishBuildCloudflare = async ({ buildId }) => {
   // 1. Sync build data
   log(`Syncing build data for ${domain}...`);
   await run(
-    `${WEBSTUDIO_CLI} sync --buildId=${buildId} --origin=${BUILDER_INTERNAL_URL} --authToken=${SERVICE_TOKEN}`
+    `${WEBSTUDIO_CLI} sync --buildId=${buildId} --origin=${BUILDER_INTERNAL_URL} --authToken=$WS_BUILDER_TOKEN`,
+    { WS_BUILDER_TOKEN: SERVICE_TOKEN }
   );
 
   // 2. Generate Cloudflare project code
@@ -828,17 +841,22 @@ const publishBuildCloudflare = async ({ buildId }) => {
  * absolute). Returns the dist dir.
  */
 const buildSsgOutput = async ({ buildId, domain, workDir, publicOrigin }) => {
-  const run = async (cmd) => {
-    log(`  $ ${cmd}`);
-    const { stdout, stderr } = await execAsync(cmd, { cwd: workDir, maxBuffer: 10 * 1024 * 1024 });
-    if (stdout) log(`  stdout: ${stdout.trim()}`);
-    if (stderr) log(`  stderr: ${stderr.trim()}`);
+  const run = async (cmd, extraEnv = {}) => {
+    log(`  $ ${redactSecrets(cmd)}`);
+    const { stdout, stderr } = await execAsync(cmd, {
+      cwd: workDir,
+      maxBuffer: 10 * 1024 * 1024,
+      env: { ...process.env, ...extraEnv },
+    });
+    if (stdout) log(`  stdout: ${redactSecrets(stdout.trim())}`);
+    if (stderr) log(`  stderr: ${redactSecrets(stderr.trim())}`);
   };
 
   // 1. Sync build data (via URL interne Docker, pas besoin de passer par Traefik/TLS)
   log(`Syncing build data for ${domain}...`);
   await run(
-    `${WEBSTUDIO_CLI} sync --buildId=${buildId} --origin=${BUILDER_INTERNAL_URL} --authToken=${SERVICE_TOKEN}`
+    `${WEBSTUDIO_CLI} sync --buildId=${buildId} --origin=${BUILDER_INTERNAL_URL} --authToken=$WS_BUILDER_TOKEN`,
+    { WS_BUILDER_TOKEN: SERVICE_TOKEN }
   );
 
   // 2. Generate SSG project code (copies template + generates pages)
@@ -1200,14 +1218,14 @@ const buildDockerImage = async ({
   hostnames = [],
 }) => {
   const run = async (cmd, extraEnv = {}) => {
-    log(`  $ ${cmd}`);
+    log(`  $ ${redactSecrets(cmd)}`);
     const { stdout, stderr } = await execAsync(cmd, {
       cwd: workDir,
       maxBuffer: 10 * 1024 * 1024,
       env: { ...process.env, ...extraEnv },
     });
-    if (stdout) log(`  stdout: ${stdout.trim()}`);
-    if (stderr) log(`  stderr: ${stderr.trim()}`);
+    if (stdout) log(`  stdout: ${redactSecrets(stdout.trim())}`);
+    if (stderr) log(`  stderr: ${redactSecrets(stderr.trim())}`);
   };
 
   // Drop a stale .dockerignore left by a previous ssg:coolify publish — this
@@ -1217,7 +1235,8 @@ const buildDockerImage = async ({
   // 1. Sync build data
   log(`Syncing build data for ${domain}...`);
   await run(
-    `${WEBSTUDIO_CLI} sync --buildId=${buildId} --origin=${BUILDER_INTERNAL_URL} --authToken=${SERVICE_TOKEN}`
+    `${WEBSTUDIO_CLI} sync --buildId=${buildId} --origin=${BUILDER_INTERNAL_URL} --authToken=$WS_BUILDER_TOKEN`,
+    { WS_BUILDER_TOKEN: SERVICE_TOKEN }
   );
 
   // 2. Generate Docker project code (react-router-docker template)
@@ -1516,14 +1535,14 @@ const deployImageToCoolify = async ({
 };
 
 const runInWorkDir = (workDir) => async (cmd, extraEnv = {}) => {
-  log(`  $ ${cmd}`);
+  log(`  $ ${redactSecrets(cmd)}`);
   const { stdout, stderr } = await execAsync(cmd, {
     cwd: workDir,
     maxBuffer: 10 * 1024 * 1024,
     env: { ...process.env, ...extraEnv },
   });
-  if (stdout) log(`  stdout: ${stdout.trim()}`);
-  if (stderr) log(`  stderr: ${stderr.trim()}`);
+  if (stdout) log(`  stdout: ${redactSecrets(stdout.trim())}`);
+  if (stderr) log(`  stderr: ${redactSecrets(stderr.trim())}`);
 };
 
 /**
@@ -1996,9 +2015,9 @@ const server = createServer(async (req, res) => {
         })
         .then(() => notifyBuildStatus(buildId, "PUBLISHED"))
         .catch((err) => {
-          logErr(`Publish failed for build ${buildId}: ${err.message}`);
+          logErr(`Publish failed for build ${buildId}: ${redactSecrets(err.message)}`);
           notifyBuildStatus(buildId, "FAILED").catch((notifyErr) =>
-            logErr(`Failed to notify FAILED status for ${buildId}: ${notifyErr.message}`)
+            logErr(`Failed to notify FAILED status for ${buildId}: ${redactSecrets(notifyErr.message)}`)
           );
         });
     });
