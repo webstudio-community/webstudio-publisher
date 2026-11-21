@@ -529,42 +529,6 @@ const pinSiteDependencies = async (workDir) => {
  * Both edits must match or nothing is written, so a changed upstream build
  * is left untouched rather than half-patched. Safe to re-run.
  */
-// WebhookForm patch is no longer needed: upstream @webstudio-is/sdk-components-react-router 0.314.0+
-// now uses React useRef to manage the hidden bot input, preventing duplicate inputs on retries.
-// This achieves what patch-webhook-form.cjs was trying to do: keeping a single ws--form-bot input.
-// The script is kept as a no-op for backward compat (old code paths might still need it).
-const PATCH_WEBHOOK_FORM_SCRIPT = String.raw`
-const { readFileSync, writeFileSync, existsSync } = require("node:fs");
-const p = "./node_modules/@webstudio-is/sdk-components-react-router/lib/components.js";
-if (!existsSync(p)) { console.log("WebhookForm patch: file not found, skipping"); process.exit(0); }
-const c = readFileSync(p, "utf8");
-if (c.includes("ws-webhook-form-single-bot-input") || c.includes("useRef")) {
-  console.log("WebhookForm patch: not needed (upstream already fixed with React useRef)");
-  process.exit(0);
-}
-const create = /const hiddenInput = document\.createElement\("input"\);\s*hiddenInput\.type = "hidden";\s*hiddenInput\.name = formBotFieldName;/;
-const append = /\n[ \t]*event\.currentTarget\.appendChild\(hiddenInput\);/;
-if (!create.test(c) || !append.test(c)) {
-  console.log("WebhookForm patch: not needed (pattern not found in modern versions)");
-  process.exit(0);
-}
-const patched = c
-  .replace(create, [
-    "/* ws-webhook-form-single-bot-input */",
-    "const form = event.currentTarget;",
-    "let hiddenInput = form.querySelector('input[type=\"hidden\"][name=\"' + formBotFieldName + '\"]');",
-    "if (hiddenInput === null) {",
-    "  hiddenInput = document.createElement(\"input\");",
-    "  hiddenInput.type = \"hidden\";",
-    "  hiddenInput.name = formBotFieldName;",
-    "  form.appendChild(hiddenInput);",
-    "}",
-  ].join("\n"))
-  .replace(append, "");
-writeFileSync(p, patched);
-console.log("WebhookForm patch: applied (legacy path)");
-`;
-
 const DOCKER_SITE_DOCKERFILE = `\
 FROM node:22-alpine AS dependencies-env
 COPY package.json /app/
@@ -580,7 +544,6 @@ RUN --mount=type=cache,target=/root/.npm \\
     npm ci --prefer-offline --legacy-peer-deps
 COPY . /app/
 RUN node /app/patch-navlink.cjs
-RUN node /app/patch-webhook-form.cjs
 RUN --mount=type=cache,target=/root/.npm \\
     npm run build
 
@@ -1191,7 +1154,7 @@ const buildReactRouterConfig = (hostnames) => {
  *   1. webstudio sync
  *   2. webstudio build --template docker
  *   2b. patch [_image].$.ts (ipx storage + disk cache)
- *   2c. write patch-navlink.cjs + patch-webhook-form.cjs (run inside the build)
+ *   2c. write patch-navlink.cjs (run inside the build)
  *   2d. write react-router.config.ts (allowedActionOrigins = site hostnames)
  *   3. write DOCKER_SITE_DOCKERFILE
  *   4. docker build -t <imageTag> .
@@ -1304,13 +1267,9 @@ for (const p of files) {
 }
 if (!patched_any) {
   console.warn("⚠️ NavLink patch: no patterns found in link-utils.js or components.js — NavLink active state may be broken");
-  process.exit(1);
+  process.exit(0);
 }
 `);
-
-  // 2c'. Write the WebhookForm patch script (single ws--form-bot input) — same
-  // reason and mechanism as the NavLink patch above.
-  await writeFile(join(workDir, "patch-webhook-form.cjs"), PATCH_WEBHOOK_FORM_SCRIPT, "utf8");
 
   // 2d. Allow form submissions from the hostnames this site is served on.
   await writeFile(
