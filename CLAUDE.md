@@ -45,16 +45,22 @@ POST /publish { buildId, builderOrigin, buildMode: "ssr" }
   → écriture de patch-navlink.cjs (lancé dans le docker build : stage build pour le bundle client ET image finale pour les node_modules du serveur SSR)
   → écriture de DOCKER_SITE_DOCKERFILE dans workDir/Dockerfile
   → DOCKER_BUILDKIT=1 docker build -t <ws-domain> .   ← une seule fois
-  → docker stop/rm <container> ; docker run -d --restart=unless-stopped --network=$DOCKER_NETWORK
-  → docker image prune -f
+  → docker run -d --init --restart=unless-stopped --network=$DOCKER_NETWORK --name <ws-domain>-<ts base36>
+     (l'ancien container continue de servir le site)
+  → waitForContainerReady : GET <nouveau>:3000/ jusqu'à réponse < 500 (CONTAINER_READY_TIMEOUT_MS)
+     → échec : nouveau container supprimé, l'ancien reste en ligne, la publication échoue
   → state.json { mode: "docker", imageName, containerName, publishDomain, customDomains }
-  → tous les hostnames (publishDomain + customDomains) enregistrés dans dockerHostContainer
+  → bascule de dockerHostContainer vers le nouveau container (custom domains retirés depuis = supprimés)
+  → attente CONTAINER_DRAIN_MS (5 s) puis docker stop/rm de l'ancien container
+  → docker image prune -f
 ```
+
+Déploiement blue/green : aucune coupure du site pendant une publication.
 
 **Infra requise** : monter `/var/run/docker.sock` dans le container publisher.
 Un warning est loggé au démarrage si le socket n'est pas accessible.
 
-Un seul container par domaine (nom = `ws-<slug>`), joignable par le proxy sur
+Un seul container par domaine hors bascule (nom = `ws-<slug>-<timestamp base36>`, change à chaque publication — la source de vérité est `state.json.containerName`), joignable par le proxy sur
 `<container>:3000` via `DOCKER_NETWORK` — pas de mapping de port publié.
 
 **Pourquoi un patch dans le build** : le site installe `@webstudio-is/sdk-components-react-router`
@@ -79,7 +85,7 @@ POST /publish { buildId, builderOrigin, buildMode: "ssg" }
   → npm install (si node_modules absent ou vike version changée)
   → WEBSTUDIO_PRERENDER_ORIGIN=... WEBSTUDIO_SITEMAP_ORIGIN=... npx vite build
   → réécriture des URLs absolues (.html et .xml) vers l'origine publique
-  → cp dist/client → /var/publish/<domain>/ (+ une copie par custom domain,
+  → cp dist/client → dossier caché puis rename atomique vers /var/publish/<domain>/ (publishDirAtomically, sans coupure ; + une copie par custom domain,
     réécrite vers l'origine de ce domaine)
   → state.json { mode: "ssg", publishDomain, customDomains }
 ```
@@ -218,7 +224,7 @@ Le serveur proxy sur port 4001 sert tous les sites publiés :
 
 Chaque domaine publié écrit `/var/work/<domain>/state.json` :
 ```json
-{ "mode": "docker", "imageName": "ws-mysite", "containerName": "ws-mysite", "publishDomain": "mysite.wstd.work", "customDomains": [] }
+{ "mode": "docker", "imageName": "ws-mysite", "containerName": "ws-mysite-mi8x2k1a", "publishDomain": "mysite.wstd.work", "customDomains": [] }
 ```
 `mode` ∈ `ssg` | `docker` | `cloudflare` | `ssh` | `coolify`. C'est ce qui permet à
 la publication suivante de détecter le mode précédent et de nettoyer ce qu'il faut
@@ -237,6 +243,7 @@ Au démarrage, `restoreTargets()` relit tous les `state.json` : les containers D
 | `TRAEFIK_DYNAMIC_DIR` | Si défini, écrit les configs Traefik pour les domaines custom |
 | `PORT` | Port de l'API build (défaut: 4000) |
 | `PROXY_PORT` | Port du proxy de sites (défaut: 4001) |
+| `CONTAINER_READY_TIMEOUT_MS` | Attente max pour qu'un nouveau container SSR réponde avant d'abandonner et garder l'ancien en ligne (défaut: 60000) |
 | `MAX_CONCURRENT_PUBLISHES` | Nb max de publications simultanées, tous domaines confondus (défaut: 0 = illimité ; file FIFO au-delà) |
 | `CLOUDFLARE_API_TOKEN` | Token Wrangler pour deploy CF Pages (mode `cloudflare`) |
 | `CLOUDFLARE_ACCOUNT_ID` | ID compte Cloudflare (mode `cloudflare`) |

@@ -38,8 +38,8 @@ import { createServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { exec } from "node:child_process";
 import { createReadStream } from "node:fs";
-import { mkdir, cp, rm, access, readdir, readFile, writeFile, stat, chmod } from "node:fs/promises";
-import { join, extname } from "node:path";
+import { mkdir, cp, rm, rename, access, readdir, readFile, writeFile, stat, chmod } from "node:fs/promises";
+import { join, extname, dirname, basename } from "node:path";
 import { promisify } from "node:util";
 import { networkInterfaces } from "node:os";
 
@@ -943,6 +943,33 @@ const buildSsgOutput = async ({ buildId, domain, workDir, publicOrigin }) => {
 };
 
 /**
+ * Replace destDir with a copy of srcDir without a window where the site is
+ * missing: the copy (and optional `prepare` step) goes to a hidden staging dir
+ * next to destDir, then two renames swap it in. The staging names start with
+ * "." so no request Host can ever resolve to them.
+ */
+const publishDirAtomically = async (srcDir, destDir, prepare) => {
+  const parent = dirname(destDir);
+  const suffix = Date.now().toString(36);
+  const stagingDir = join(parent, `.${basename(destDir)}.new-${suffix}`);
+  const oldDir = join(parent, `.${basename(destDir)}.old-${suffix}`);
+  await cp(srcDir, stagingDir, { recursive: true });
+  try {
+    if (prepare) await prepare(stagingDir);
+    try {
+      await rename(destDir, oldDir);
+    } catch (err) {
+      if (err.code !== "ENOENT") throw err; // first publish — nothing to move aside
+    }
+    await rename(stagingDir, destDir);
+  } catch (err) {
+    await rm(stagingDir, { recursive: true, force: true });
+    throw err;
+  }
+  await rm(oldDir, { recursive: true, force: true });
+};
+
+/**
  * Generate static files for the given build and write them to /var/publish/,
  * one directory per hostname (the staging domain + each verified custom domain).
  * A previous runtime (Docker container, Cloudflare route) is torn down first.
@@ -988,18 +1015,17 @@ const publishBuild = async ({ buildId }) => {
   // 5. Copy built files to the serve directory
   const destDir = join(PUBLISH_DIR, publishDomain);
   log(`Publishing ${domain} to ${destDir}...`);
-  await rm(destDir, { recursive: true, force: true });
-  await cp(distDir, destDir, { recursive: true });
+  await publishDirAtomically(distDir, destDir);
 
   // 5b. Also copy to each verified custom domain directory, rewriting the origin
   // baked in above to the custom domain.
   for (const customDomain of customDomains) {
     const customDestDir = join(PUBLISH_DIR, customDomain);
     log(`Publishing custom domain ${customDomain} to ${customDestDir}...`);
-    await rm(customDestDir, { recursive: true, force: true });
-    await cp(distDir, customDestDir, { recursive: true });
-    log(`  Rewriting absolute URLs to https://${customDomain}...`);
-    await transformOutputFiles(customDestDir, (html) => html.replaceAll(publicOrigin, `https://${customDomain}`));
+    await publishDirAtomically(distDir, customDestDir, async (stagingDir) => {
+      log(`  Rewriting absolute URLs to https://${customDomain}...`);
+      await transformOutputFiles(stagingDir, (html) => html.replaceAll(publicOrigin, `https://${customDomain}`));
+    });
     await writeTraefikRouteForDomain(customDomain);
   }
 
@@ -1347,8 +1373,14 @@ const publishBuildSsr = async ({ buildId }) => {
 
   // Handle mode transitions → docker
   const stateFile = join(workDir, "state.json");
+  // Container serving the site right now (previous docker publish), kept up
+  // until the new one answers — see the blue/green switch below.
+  let previousContainer;
   try {
     const prevState = JSON.parse(await readFile(stateFile, "utf8"));
+    if (prevState.mode === "docker") {
+      previousContainer = prevState.containerName;
+    }
     if (prevState.mode === "ssg") {
       // Remove stale static files so the proxy stops serving them directly
       for (const h of [prevState.publishDomain ?? publishDomain, ...(prevState.customDomains ?? [])]) {
@@ -1362,7 +1394,7 @@ const publishBuildSsr = async ({ buildId }) => {
       cfProjectHost.delete(prevState.publishDomain);
       log(`${domain} was on Cloudflare Pages — project "${prevState.cfProjectName}" left in place and still live`);
     }
-    // mode: "docker" → old container is stopped below
+    // mode: "docker" → old container is stopped below, once the new one is up
   } catch { /* no state.json — new domain */ }
 
   const imageName = toDockerName(domain);
@@ -1374,17 +1406,25 @@ const publishBuildSsr = async ({ buildId }) => {
     hostnames: [publishDomain, ...customDomains],
   });
 
-  // Stop/remove old container + start fresh one on the shared Docker network
-  const containerName = imageName;
+  // Blue/green deploy: start the new container under a fresh name next to the
+  // one still serving the site, wait until it answers, switch the proxy, and
+  // only then stop the old one — the site never goes down during a publish.
+  // --init makes the container stop on SIGTERM right away (npm, as PID 1,
+  // doesn't forward it, so `docker stop` used to wait its full 10 s timeout).
+  const containerName = `${imageName}-${Date.now().toString(36)}`;
   log(`Deploying container ${containerName}...`);
-  try { await run(`docker stop ${containerName}`); } catch {}
-  try { await run(`docker rm ${containerName}`); } catch {}
   await run(
-    `docker run -d --restart=unless-stopped --network=${DOCKER_NETWORK} --name ${containerName} -v ${imageName}-ipx-cache:/var/cache/ipx -e IPX_HTTP_ALLOW_ALL_DOMAINS=true ${imageName}`
+    `docker run -d --init --restart=unless-stopped --network=${DOCKER_NETWORK} --name ${containerName} -v ${imageName}-ipx-cache:/var/cache/ipx -e IPX_HTTP_ALLOW_ALL_DOMAINS=true ${imageName}`
   );
 
-  // Prune dangling images from previous builds
-  try { await run(`docker image prune -f`); } catch {}
+  try {
+    await waitForContainerReady(containerName);
+  } catch (err) {
+    // The previous container (if any) is untouched and keeps serving the site.
+    try { await run(`docker logs --tail 50 ${containerName}`); } catch {}
+    try { await run(`docker rm -f ${containerName}`); } catch {}
+    throw err;
+  }
 
   await writeFile(
     join(workDir, "state.json"),
@@ -1392,14 +1432,75 @@ const publishBuildSsr = async ({ buildId }) => {
     "utf8"
   );
 
-  // Register all hostnames → container name in the proxy (container:3000 on DOCKER_NETWORK)
+  // Register all hostnames → container name in the proxy (container:3000 on
+  // DOCKER_NETWORK). Map updates are synchronous, so the switch is atomic.
   const allHostnames = [publishDomain, ...customDomains];
   for (const hostname of allHostnames) {
     dockerHostContainer.set(hostname, containerName);
+  }
+  // A custom domain dropped since the last publish no longer goes to this site
+  // (the Traefik route itself is left as before).
+  for (const [hostname, container] of dockerHostContainer) {
+    if (container === previousContainer) dockerHostContainer.delete(hostname);
+  }
+  for (const hostname of allHostnames) {
     await writeTraefikRouteForDomain(hostname);
   }
 
+  // Retire the previous container once in-flight requests have drained.
+  if (previousContainer !== undefined && previousContainer !== containerName) {
+    await new Promise((resolve) => setTimeout(resolve, CONTAINER_DRAIN_MS));
+    try { await run(`docker stop ${previousContainer}`); } catch {}
+    try { await run(`docker rm ${previousContainer}`); } catch {}
+  }
+
+  // Prune dangling images from previous builds (the old container no longer holds its image)
+  try { await run(`docker image prune -f`); } catch {}
+
   log(`Successfully published Docker site ${domain} (container ${containerName})`);
+};
+
+// Max wait for a freshly started SSR container to answer before giving up and
+// keeping the previous one online.
+const CONTAINER_READY_TIMEOUT_MS =
+  Number.parseInt(process.env.CONTAINER_READY_TIMEOUT_MS ?? "60000", 10) || 60000;
+// Grace period between switching the proxy to the new container and stopping
+// the old one, so requests already in flight can finish.
+const CONTAINER_DRAIN_MS = 5000;
+
+/**
+ * Poll http://<container>:3000/ until the site answers with a non-5xx status.
+ * Throws after CONTAINER_READY_TIMEOUT_MS.
+ */
+const waitForContainerReady = async (containerName) => {
+  const deadline = Date.now() + CONTAINER_READY_TIMEOUT_MS;
+  let lastError = "no response";
+  while (Date.now() < deadline) {
+    const status = await new Promise((resolve) => {
+      const req = httpRequest(
+        { hostname: containerName, port: 3000, path: "/", method: "GET", timeout: 5000 },
+        (res) => {
+          res.resume();
+          resolve(res.statusCode);
+        }
+      );
+      req.on("timeout", () => req.destroy(new Error("request timeout")));
+      req.on("error", (err) => {
+        lastError = err.message;
+        resolve(undefined);
+      });
+      req.end();
+    });
+    if (status !== undefined && status < 500) {
+      log(`Container ${containerName} is ready (HTTP ${status})`);
+      return;
+    }
+    if (status !== undefined) lastError = `HTTP ${status}`;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(
+    `Container ${containerName} not ready after ${CONTAINER_READY_TIMEOUT_MS} ms (${lastError}) — previous version kept online`
+  );
 };
 
 // ─── Remote Coolify pipeline (SSR image → registry → deploy webhook) ─────────
