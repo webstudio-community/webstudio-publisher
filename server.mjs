@@ -92,22 +92,16 @@ const log = (msg) => console.info(`[publisher] ${msg}`);
 const logErr = (msg) => console.error(`[publisher] ${msg}`);
 
 /**
- * Redact sensitive tokens from a command string for safe logging.
- * Replaces known secrets with placeholders to prevent accidental leaks.
+ * Mask known secrets in any text (command, stdout/stderr, error message) before logging it.
  */
-const redactSecretsFromCommand = (cmd) => {
-  let redacted = cmd;
-  if (SERVICE_TOKEN && cmd.includes(SERVICE_TOKEN)) {
-    redacted = redacted.replace(new RegExp(SERVICE_TOKEN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '<REDACTED_BUILDER_TOKEN>');
-  }
-  if (CF_API_TOKEN && cmd.includes(CF_API_TOKEN)) {
-    redacted = redacted.replace(new RegExp(CF_API_TOKEN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '<REDACTED_CF_TOKEN>');
-  }
-  if (REGISTRY_TOKEN && cmd.includes(REGISTRY_TOKEN)) {
-    redacted = redacted.replace(new RegExp(REGISTRY_TOKEN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '<REDACTED_REGISTRY_TOKEN>');
-  }
-  return redacted;
-};
+const SECRETS = [
+  [SERVICE_TOKEN, "<REDACTED_BUILDER_TOKEN>"],
+  [CF_API_TOKEN, "<REDACTED_CF_TOKEN>"],
+  [REGISTRY_TOKEN, "<REDACTED_REGISTRY_TOKEN>"],
+].filter(([secret]) => secret);
+
+const redactSecrets = (text) =>
+  SECRETS.reduce((acc, [secret, mask]) => acc.replaceAll(secret, mask), String(text));
 
 // ─── Docker container management ─────────────────────────────────────────────
 
@@ -292,7 +286,7 @@ const getProjectBuildInfo = async (buildId) => {
   });
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`Failed to fetch build ${buildId}: ${redactSecretsFromCommand(text.slice(0, 500))}`);
+    throw new Error(`Failed to fetch build ${buildId}: ${redactSecrets(text.slice(0, 500))}`);
   }
   const wrapper = await response.json();
   const data = wrapper?.result?.data;
@@ -322,12 +316,12 @@ const notifyBuildStatus = async (buildId, publishStatus) => {
     });
     if (!response.ok) {
       const text = await response.text();
-      logErr(`notifyBuildStatus(${buildId}, ${publishStatus}) failed: ${redactSecretsFromCommand(text.slice(0, 200))}`);
+      logErr(`notifyBuildStatus(${buildId}, ${publishStatus}) failed: ${redactSecrets(text.slice(0, 200))}`);
     } else {
       log(`notifyBuildStatus(${buildId}, ${publishStatus}) OK`);
     }
   } catch (err) {
-    logErr(`notifyBuildStatus(${buildId}, ${publishStatus}) error: ${redactSecretsFromCommand(err.message)}`);
+    logErr(`notifyBuildStatus(${buildId}, ${publishStatus}) error: ${redactSecrets(err.message)}`);
   }
 };
 
@@ -727,14 +721,14 @@ const publishBuildCloudflare = async ({ buildId }) => {
   await mkdir(workDir, { recursive: true });
 
   const run = async (cmd, extraEnv = {}) => {
-    log(`  $ ${redactSecretsFromCommand(cmd)}`);
+    log(`  $ ${redactSecrets(cmd)}`);
     const { stdout, stderr } = await execAsync(cmd, {
       cwd: workDir,
       maxBuffer: 10 * 1024 * 1024,
       env: { ...process.env, ...extraEnv },
     });
-    if (stdout) log(`  stdout: ${redactSecretsFromCommand(stdout.trim())}`);
-    if (stderr) log(`  stderr: ${redactSecretsFromCommand(stderr.trim())}`);
+    if (stdout) log(`  stdout: ${redactSecrets(stdout.trim())}`);
+    if (stderr) log(`  stderr: ${redactSecrets(stderr.trim())}`);
   };
 
   // Handle mode transitions → cloudflare. Without this a site that was
@@ -848,14 +842,14 @@ const publishBuildCloudflare = async ({ buildId }) => {
  */
 const buildSsgOutput = async ({ buildId, domain, workDir, publicOrigin }) => {
   const run = async (cmd, extraEnv = {}) => {
-    log(`  $ ${redactSecretsFromCommand(cmd)}`);
+    log(`  $ ${redactSecrets(cmd)}`);
     const { stdout, stderr } = await execAsync(cmd, {
       cwd: workDir,
       maxBuffer: 10 * 1024 * 1024,
       env: { ...process.env, ...extraEnv },
     });
-    if (stdout) log(`  stdout: ${redactSecretsFromCommand(stdout.trim())}`);
-    if (stderr) log(`  stderr: ${redactSecretsFromCommand(stderr.trim())}`);
+    if (stdout) log(`  stdout: ${redactSecrets(stdout.trim())}`);
+    if (stderr) log(`  stderr: ${redactSecrets(stderr.trim())}`);
   };
 
   // 1. Sync build data (via URL interne Docker, pas besoin de passer par Traefik/TLS)
@@ -1224,14 +1218,14 @@ const buildDockerImage = async ({
   hostnames = [],
 }) => {
   const run = async (cmd, extraEnv = {}) => {
-    log(`  $ ${redactSecretsFromCommand(cmd)}`);
+    log(`  $ ${redactSecrets(cmd)}`);
     const { stdout, stderr } = await execAsync(cmd, {
       cwd: workDir,
       maxBuffer: 10 * 1024 * 1024,
       env: { ...process.env, ...extraEnv },
     });
-    if (stdout) log(`  stdout: ${redactSecretsFromCommand(stdout.trim())}`);
-    if (stderr) log(`  stderr: ${redactSecretsFromCommand(stderr.trim())}`);
+    if (stdout) log(`  stdout: ${redactSecrets(stdout.trim())}`);
+    if (stderr) log(`  stderr: ${redactSecrets(stderr.trim())}`);
   };
 
   // Drop a stale .dockerignore left by a previous ssg:coolify publish — this
@@ -1541,14 +1535,14 @@ const deployImageToCoolify = async ({
 };
 
 const runInWorkDir = (workDir) => async (cmd, extraEnv = {}) => {
-  log(`  $ ${redactSecretsFromCommand(cmd)}`);
+  log(`  $ ${redactSecrets(cmd)}`);
   const { stdout, stderr } = await execAsync(cmd, {
     cwd: workDir,
     maxBuffer: 10 * 1024 * 1024,
     env: { ...process.env, ...extraEnv },
   });
-  if (stdout) log(`  stdout: ${redactSecretsFromCommand(stdout.trim())}`);
-  if (stderr) log(`  stderr: ${redactSecretsFromCommand(stderr.trim())}`);
+  if (stdout) log(`  stdout: ${redactSecrets(stdout.trim())}`);
+  if (stderr) log(`  stderr: ${redactSecrets(stderr.trim())}`);
 };
 
 /**
@@ -2021,9 +2015,9 @@ const server = createServer(async (req, res) => {
         })
         .then(() => notifyBuildStatus(buildId, "PUBLISHED"))
         .catch((err) => {
-          logErr(`Publish failed for build ${buildId}: ${redactSecretsFromCommand(err.message)}`);
+          logErr(`Publish failed for build ${buildId}: ${redactSecrets(err.message)}`);
           notifyBuildStatus(buildId, "FAILED").catch((notifyErr) =>
-            logErr(`Failed to notify FAILED status for ${buildId}: ${redactSecretsFromCommand(notifyErr.message)}`)
+            logErr(`Failed to notify FAILED status for ${buildId}: ${redactSecrets(notifyErr.message)}`)
           );
         });
     });
