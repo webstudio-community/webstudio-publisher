@@ -87,12 +87,13 @@ accepts form submissions after the next publish. Other origins stay rejected.
 Sites install `@webstudio-is/sdk-components-react-router` from the upstream npm
 registry, so fixes made in the fork's copy never reach them. The publisher
 patches the compiled package inside the site's `docker build` instead
-(`patch-navlink.cjs`, `patch-webhook-form.cjs`). Each script only writes when
-its pattern matches, so an upstream change leaves the package untouched.
+(`patch-navlink.cjs`). The script only writes when its pattern matches, so an
+upstream change leaves the package untouched.
 
-- **WebhookForm** — reuses one hidden `ws--form-bot` input instead of appending
-  a new one on every submit (a stale first value made retries fail with
-  `Form bot value invalid` after 5 minutes).
+- **NavLink** — a `/#section` link is only marked active (`aria-current="page"`)
+  when the current URL has the same anchor; a plain `/` link stays active on its
+  page. Applied to the client bundle and to the runtime `node_modules` used by
+  the SSR server. A visible `⚠️` warning is logged if the pattern is not found.
 
 ### `host: "coolify"` — deploy to a remote Coolify (SSR or SSG)
 

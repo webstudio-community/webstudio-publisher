@@ -42,7 +42,7 @@ POST /publish { buildId, builderOrigin, buildMode: "ssr" }
   → webstudio sync --buildId --origin --authToken
   → webstudio build --template docker
   → écriture de react-router.config.ts (allowedActionOrigins = publishDomain + customDomains)
-  → écriture de patch-navlink.cjs + patch-webhook-form.cjs (lancés dans le docker build)
+  → écriture de patch-navlink.cjs (lancé dans le docker build : stage build pour le bundle client ET image finale pour les node_modules du serveur SSR)
   → écriture de DOCKER_SITE_DOCKERFILE dans workDir/Dockerfile
   → DOCKER_BUILDKIT=1 docker build -t <ws-domain> .   ← une seule fois
   → docker stop/rm <container> ; docker run -d --restart=unless-stopped --network=$DOCKER_NETWORK
@@ -57,10 +57,9 @@ Un warning est loggé au démarrage si le socket n'est pas accessible.
 Un seul container par domaine (nom = `ws-<slug>`), joignable par le proxy sur
 `<container>:3000` via `DOCKER_NETWORK` — pas de mapping de port publié.
 
-**Pourquoi des patchs dans le build** : le site installe `@webstudio-is/sdk-components-react-router`
+**Pourquoi un patch dans le build** : le site installe `@webstudio-is/sdk-components-react-router`
 depuis le registre npm **upstream** (version du CLI) — un correctif dans le fork ne l'atteint jamais.
-`patch-navlink.cjs` / `patch-webhook-form.cjs` réécrivent `lib/components.js` compilé, ne s'appliquent que si
-le motif est trouvé (sinon no-op) et sont idempotents.
+`patch-navlink.cjs` réécrit `lib/components.js` compilé (SDK < 0.314.0) et `@webstudio-is/sdk/lib/link-utils.js` (SDK ≥ 0.314.0, où la logique active-link a migré). Le patch ne s'applique que si le motif est trouvé (sinon warning visible et exit 0) et est idempotent.
 
 **`allowedActionOrigins`** : React Router 7 refuse un POST dont l'`Origin` ≠ `request.url` ; derrière le
 proxy TLS le container ne voit que du `http` → 400 sur tout formulaire. Liste exacte de hostnames, figée
