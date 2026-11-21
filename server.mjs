@@ -529,19 +529,23 @@ const pinSiteDependencies = async (workDir) => {
  * Both edits must match or nothing is written, so a changed upstream build
  * is left untouched rather than half-patched. Safe to re-run.
  */
+// WebhookForm patch is no longer needed: upstream @webstudio-is/sdk-components-react-router 0.314.0+
+// now uses React useRef to manage the hidden bot input, preventing duplicate inputs on retries.
+// This achieves what patch-webhook-form.cjs was trying to do: keeping a single ws--form-bot input.
+// The script is kept as a no-op for backward compat (old code paths might still need it).
 const PATCH_WEBHOOK_FORM_SCRIPT = String.raw`
 const { readFileSync, writeFileSync, existsSync } = require("node:fs");
 const p = "./node_modules/@webstudio-is/sdk-components-react-router/lib/components.js";
 if (!existsSync(p)) { console.log("WebhookForm patch: file not found, skipping"); process.exit(0); }
 const c = readFileSync(p, "utf8");
-if (c.includes("ws-webhook-form-single-bot-input")) {
-  console.log("WebhookForm patch: already applied");
+if (c.includes("ws-webhook-form-single-bot-input") || c.includes("useRef")) {
+  console.log("WebhookForm patch: not needed (upstream already fixed with React useRef)");
   process.exit(0);
 }
 const create = /const hiddenInput = document\.createElement\("input"\);\s*hiddenInput\.type = "hidden";\s*hiddenInput\.name = formBotFieldName;/;
 const append = /\n[ \t]*event\.currentTarget\.appendChild\(hiddenInput\);/;
 if (!create.test(c) || !append.test(c)) {
-  console.log("WebhookForm patch: pattern not found (upstream changed?), skipping");
+  console.log("WebhookForm patch: not needed (pattern not found in modern versions)");
   process.exit(0);
 }
 const patched = c
@@ -558,7 +562,7 @@ const patched = c
   ].join("\n"))
   .replace(append, "");
 writeFileSync(p, patched);
-console.log("WebhookForm patch: applied");
+console.log("WebhookForm patch: applied (legacy path)");
 `;
 
 const DOCKER_SITE_DOCKERFILE = `\
@@ -1256,23 +1260,51 @@ const buildDockerImage = async ({
   } catch { /* file absent in older CLI versions — skip */ }
 
   // 2c. Write NavLink patch script — run inside the Docker build after npm ci to fix
-  // aria-current="page" being applied to all /#section links in SSR. The npm CLI
-  // installs @webstudio-is/sdk-components-react-router from the upstream registry so
-  // we patch its compiled lib/components.js before webpack compiles the site.
+  // aria-current="page" being applied to all /#section links in SSR. With
+  // @webstudio-is/sdk-components-react-router 0.314.0+, the active-link logic moved to
+  // @webstudio-is/sdk/lib/link-utils.js (isLocalLinkActive). The old file still doesn't have
+  // the proper hash logic, so we patch both locations for backward compat.
   await writeFile(join(workDir, "patch-navlink.cjs"), `
 const { readFileSync, writeFileSync, existsSync } = require("node:fs");
-const p = "./node_modules/@webstudio-is/sdk-components-react-router/lib/components.js";
-if (!existsSync(p)) { console.log("NavLink patch: file not found, skipping"); process.exit(0); }
-let c = readFileSync(p, "utf8");
-const patched = c.replace(
-  /href\\.startsWith\\("\\/"\\) && href\\.startsWith\\(assetBaseUrl\\) === false(?! && href\\.startsWith\\("\\\/#"\\))/g,
-  'href.startsWith("/") && href.startsWith(assetBaseUrl) === false && href.startsWith("/#") === false'
-);
-if (patched !== c) {
-  writeFileSync(p, patched);
-  console.log("NavLink patch: applied");
-} else {
-  console.log("NavLink patch: pattern not found (already patched or upstream changed)");
+const files = [
+  "./node_modules/@webstudio-is/sdk/lib/link-utils.js",
+  "./node_modules/@webstudio-is/sdk-components-react-router/lib/components.js"
+];
+let patched_any = false;
+for (const p of files) {
+  if (!existsSync(p)) { continue; }
+  let c = readFileSync(p, "utf8");
+  const marker = "ws-navlink-anchor-patch";
+  if (c.includes(marker)) {
+    console.log(\`NavLink patch: \${p}: already applied\`);
+    continue;
+  }
+
+  // For link-utils.js (isLocalLinkActive): fix hash condition
+  let patched = c.replace(
+    /\\(currentUrl\\.hash === "" \\|\\| targetUrl\\.hash === "" \\|\\| currentUrl\\.hash === targetUrl\\.hash\\)/g,
+    "/* " + marker + " */ (targetUrl.hash === \\\"\\\" || currentUrl.hash === targetUrl.hash)"
+  );
+
+  // Fallback for older components.js pattern (pre-0.314.0)
+  if (patched === c) {
+    patched = c.replace(
+      /href\\.startsWith\\("\\/"\\) && href\\.startsWith\\(assetBaseUrl\\) === false(?! && href\\.startsWith\\("\\\/#"\\))/g,
+      'href.startsWith("/") && href.startsWith(assetBaseUrl) === false && href.startsWith("/#") === false /* ' + marker + ' */'
+    );
+  }
+
+  if (patched !== c) {
+    writeFileSync(p, patched);
+    console.log(\`NavLink patch: \${p}: applied\`);
+    patched_any = true;
+  } else {
+    console.log(\`NavLink patch: \${p}: pattern not found\`);
+  }
+}
+if (!patched_any) {
+  console.warn("⚠️ NavLink patch: no patterns found in link-utils.js or components.js — NavLink active state may be broken");
+  process.exit(1);
 }
 `);
 
