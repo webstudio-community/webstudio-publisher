@@ -59,8 +59,7 @@ Un seul container par domaine (nom = `ws-<slug>`), joignable par le proxy sur
 
 **Pourquoi des patchs dans le build** : le site installe `@webstudio-is/sdk-components-react-router`
 depuis le registre npm **upstream** (version du CLI) — un correctif dans le fork ne l'atteint jamais.
-`patch-navlink.cjs` / `patch-webhook-form.cjs` réécrivent `lib/components.js` compilé, ne s'appliquent que si
-le motif est trouvé (sinon no-op) et sont idempotents.
+`patch-navlink.cjs` réécrit `lib/components.js` compilé (SDK < 0.314.0) et `@webstudio-is/sdk/lib/link-utils.js` (SDK ≥ 0.314.0, où la logique active-link a migré) ; `patch-webhook-form.cjs` est un no-op depuis 0.314.0 (upstream gère le champ bot via `useRef`). Ils ne s'appliquent que si le motif est trouvé (sinon no-op) et sont idempotents.
 
 **`allowedActionOrigins`** : React Router 7 refuse un POST dont l'`Origin` ≠ `request.url` ; derrière le
 proxy TLS le container ne voit que du `http` → 400 sur tout formulaire. Liste exacte de hostnames, figée
