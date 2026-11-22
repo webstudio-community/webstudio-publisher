@@ -121,9 +121,11 @@ jobs:
           TAG="${IMAGE_NAME}:${IMAGE_TAG}"
           DIGEST=$(docker buildx imagetools inspect "$TAG" --format '{{ .Manifest.Digest }}' 2>/dev/null || echo "unknown")
           SHORT_SHA="${{ github.event.pull_request.head.sha }}" && SHORT_SHA="${SHORT_SHA:0:7}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
-          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=$TAG"
+            echo "digest=$DIGEST"
+            echo "short_sha=$SHORT_SHA"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Upsert PR comment
         env:
