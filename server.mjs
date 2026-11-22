@@ -149,11 +149,11 @@ const updateDepsHash = async (nodeModulesPath, pkg) => {
 const PUBLISH_LOG_RETENTION = Math.max(1, Number.parseInt(process.env.PUBLISH_LOG_RETENTION ?? "5", 10) || 5);
 
 /**
- * In-memory tracking of active publish logs (buildId → { domain, startedAt, lines, failedStage }).
+ * In-memory tracking of active publish logs (buildId → { domain, startedAt, lines, currentStage }).
  * Persisted logs live in /var/work/<domain>/logs/<buildId>.log.
  * Files are retained per domain (keep newest N builds).
  */
-const activeLogs = new Map(); // buildId → { domain, startedAt, lines, failedStage }
+const activeLogs = new Map(); // buildId → { domain, startedAt, lines, currentStage }
 
 /**
  * Record a log line during an active publish. Called by exec wrappers.
@@ -166,6 +166,38 @@ const recordLogLine = (buildId, stage, text) => {
   existing.lines.push(`[${timestamp}] [${stage}] ${redacted}`);
 };
 
+// Stages must match `failedStage` in the builder's publishLogOutput contract
+// (packages/trpc-interface/src/shared/deployment-contract.ts in webstudio-fork).
+const stageRules = [
+  [/\bcli\b.*\bsync\b/, "sync"],
+  [/\bcli\b.*\bbuild\b/, "project-build"],
+  [/\bnpm (install|ci)\b/, "setup"],
+  [/\bnpm run build\b|\bdocker (buildx )?build\b/, "application-build"],
+  [/\bwrangler\b|\brsync\b|\bssh\b|\bscp\b|\bdocker (push|compose|run|rm|stop)\b|\bcurl\b/, "deploy"],
+];
+
+const knownStages = new Set([
+  "setup",
+  "sync",
+  "project-build",
+  "application-build",
+  "worker-build",
+  "assets",
+  "deploy",
+  "finalize",
+]);
+
+const stageForCommand = (cmd) =>
+  stageRules.find(([pattern]) => pattern.test(cmd))?.[1];
+
+// Remember the stage of the command about to run, so a failure reports the
+// last stage that started.
+const markStage = (buildId, cmd) => {
+  const entry = activeLogs.get(buildId);
+  const stage = stageForCommand(cmd);
+  if (entry && stage) entry.currentStage = stage;
+};
+
 /**
  * Start tracking a build's logs. Called at the start of each publish pipeline.
  */
@@ -174,7 +206,7 @@ const startLogCapture = (buildId, domain) => {
     domain,
     startedAt: new Date().toISOString(),
     lines: [],
-    failedStage: null,
+    currentStage: undefined,
   });
 };
 
@@ -288,7 +320,7 @@ const readPublishLog = async (buildId, domain, cursor) => {
       logAvailability: "available",
       startedAt,
       completedAt,
-      failedStage: failedStage ?? undefined,
+      failedStage: knownStages.has(failedStage) ? failedStage : undefined,
       log: {
         encoding: "base64url",
         chunk,
@@ -894,6 +926,7 @@ const publishBuildCloudflare = async ({ buildId }) => {
     const redactedCmd = redactSecrets(cmd);
     log(`  $ ${redactedCmd}`);
     recordLogLine(buildId, stage, `$ ${redactedCmd}`);
+    markStage(buildId, cmd);
     try {
       const { stdout, stderr } = await execAsync(cmd, {
         cwd: workDir,
@@ -1059,6 +1092,7 @@ const buildSsgOutput = async ({ buildId, domain, workDir, publicOrigin }) => {
     const redactedCmd = redactSecrets(cmd);
     log(`  $ ${redactedCmd}`);
     recordLogLine(buildId, stage, `$ ${redactedCmd}`);
+    markStage(buildId, cmd);
     try {
       const { stdout, stderr } = await execAsync(cmd, {
         cwd: workDir,
@@ -1504,6 +1538,7 @@ const buildDockerImage = async ({
     const redactedCmd = redactSecrets(cmd);
     log(`  $ ${redactedCmd}`);
     recordLogLine(buildId, stage, `$ ${redactedCmd}`);
+    markStage(buildId, cmd);
     try {
       const { stdout, stderr } = await execAsync(cmd, {
         cwd: workDir,
@@ -1677,6 +1712,7 @@ const publishBuildSsr = async ({ buildId }) => {
     const redactedCmd = redactSecrets(cmd);
     log(`  $ ${redactedCmd}`);
     recordLogLine(buildId, stage, `$ ${redactedCmd}`);
+    markStage(buildId, cmd);
     try {
       const { stdout, stderr } = await execAsync(cmd, {
         cwd: workDir,
@@ -1970,15 +2006,31 @@ const deployImageToCoolify = async ({
   }
 };
 
-const runInWorkDir = (workDir) => async (cmd, extraEnv = {}) => {
-  log(`  $ ${redactSecrets(cmd)}`);
-  const { stdout, stderr } = await execAsync(cmd, {
-    cwd: workDir,
-    maxBuffer: 10 * 1024 * 1024,
-    env: { ...process.env, ...extraEnv },
-  });
-  if (stdout) log(`  stdout: ${redactSecrets(stdout.trim())}`);
-  if (stderr) log(`  stderr: ${redactSecrets(stderr.trim())}`);
+const runInWorkDir = (workDir, buildId) => async (cmd, extraEnv = {}) => {
+  const redactedCmd = redactSecrets(cmd);
+  log(`  $ ${redactedCmd}`);
+  recordLogLine(buildId, "build", `$ ${redactedCmd}`);
+  markStage(buildId, cmd);
+  const record = ({ stdout, stderr }) => {
+    for (const [label, output] of [["stdout", stdout], ["stderr", stderr]]) {
+      if (!output) continue;
+      const trimmed = redactSecrets(output.trim());
+      log(`  ${label}: ${trimmed}`);
+      recordLogLine(buildId, "build", trimmed);
+    }
+  };
+  try {
+    record(
+      await execAsync(cmd, {
+        cwd: workDir,
+        maxBuffer: 10 * 1024 * 1024,
+        env: { ...process.env, ...extraEnv },
+      })
+    );
+  } catch (err) {
+    record({ stdout: err.stdout, stderr: err.stderr });
+    throw err;
+  }
 };
 
 /**
@@ -1999,7 +2051,7 @@ const publishBuildCoolifySsr = async ({
   const publishDomain = qualifyPublishDomain(domain);
   const workDir = join(WORK_DIR, domain);
   await mkdir(workDir, { recursive: true });
-  const run = runInWorkDir(workDir);
+  const run = runInWorkDir(workDir, buildId);
   const stateFile = join(workDir, "state.json");
 
   await stopLocalServing({ domain, stateFile, publishDomain, customDomains });
@@ -2078,7 +2130,7 @@ const publishBuildCoolifySsg = async ({
   const publishDomain = qualifyPublishDomain(domain);
   const workDir = join(WORK_DIR, domain);
   await mkdir(workDir, { recursive: true });
-  const run = runInWorkDir(workDir);
+  const run = runInWorkDir(workDir, buildId);
   const stateFile = join(workDir, "state.json");
 
   await stopLocalServing({ domain, stateFile, publishDomain, customDomains });
@@ -2454,8 +2506,11 @@ const server = createServer(async (req, res) => {
             await finishLogCapture(buildId, "succeeded", null);
           } catch (err) {
             // Publish failed — try to record the failure
-            const failedStage = err.failedStage ?? "unknown";
-            await finishLogCapture(buildId, "failed", failedStage);
+            await finishLogCapture(
+              buildId,
+              "failed",
+              activeLogs.get(buildId)?.currentStage
+            );
             throw err;
           } finally {
             releasePublishSlot();
