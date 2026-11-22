@@ -220,6 +220,37 @@ Le serveur proxy sur port 4001 sert tous les sites publiés :
 - **Cloudflare** (`mode: "cloudflare"`) : le hostname de staging est reverse-proxié vers `<project>.pages.dev`
 - **SSG** : fichiers statiques servis directement depuis `/var/publish/<host>/`
 
+## Logs de publication
+
+Chaque publication est loggée avec capture de tous les stdout/stderr des étapes (`sync`, `build`, `deploy`, etc.). Les logs sont :
+- Écrits pendant la publication dans `/var/work/<domain>/logs/<buildId>.log` (plain text, une ligne par étape)
+- Accompagnés d'une métadonnée JSON `/var/work/<domain>/logs/<buildId>.json` : `{ startedAt, completedAt, outcome, failedStage }`
+- Accessibles via l'endpoint `GET /logs/<buildId>?includeLog=true&cursor=...` (authentification Bearer requise)
+
+**Endpoint `GET /logs/<buildId>`** :
+```
+Authentification: Authorization: Bearer <TRPC_SERVER_API_TOKEN>
+
+Query params:
+  - includeLog (optional) : inclure le contenu du log (base64url, chunké)
+  - cursor (optional) : position du dernier chunk reçu (pagination)
+
+Response:
+  { 
+    availability: "pending" | "available" | "unavailable",
+    outcome?: "succeeded" | "failed",
+    logAvailability?: "available" | "unavailable",
+    startedAt?: ISO8601,
+    completedAt?: ISO8601,
+    failedStage?: enum,
+    log?: { encoding: "base64url", chunk, complete, nextCursor? }
+  }
+```
+
+Tous les secrets (tokens, clés, etc.) sont masqués dans les logs via `redactSecrets()`. Les logs sont conservés selon `PUBLISH_LOG_RETENTION` (par défaut 5 par domaine).
+
+Le POST /publish retourne maintenant `{ success: true, logHandle: <buildId> }` pour permettre au builder de récupérer les logs via getPublishLog.
+
 ## Persistance de l'état (`state.json`)
 
 Chaque domaine publié écrit `/var/work/<domain>/state.json` :
@@ -250,6 +281,7 @@ Au démarrage, `restoreTargets()` relit tous les `state.json` : les containers D
 | `CLOUDFLARE_PRODUCTION_BRANCH` | Branche de production des projets Pages créés (défaut: `main`) |
 | `REGISTRY_URL` | Registre où pousser les images SSR pour `host: coolify` (ex: `ghcr.io/my-org`) — active la cible `ssr:coolify` |
 | `REGISTRY_USER` / `REGISTRY_TOKEN` | Identifiants d'écriture du registre (si privé) |
+| `PUBLISH_LOG_RETENTION` | Nombre de logs de publication à conserver par domaine (défaut: `5`) |
 
 ## Points d'attention
 
