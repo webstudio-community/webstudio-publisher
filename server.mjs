@@ -42,6 +42,7 @@ import { mkdir, cp, rm, rename, access, readdir, readFile, writeFile, stat, chmo
 import { join, extname, dirname, basename } from "node:path";
 import { promisify } from "node:util";
 import { networkInterfaces } from "node:os";
+import { createHash } from "node:crypto";
 
 const execAsync = promisify(exec);
 
@@ -102,6 +103,236 @@ const SECRETS = [
 
 const redactSecrets = (text) =>
   SECRETS.reduce((acc, [secret, mask]) => acc.replaceAll(secret, mask), String(text));
+
+/**
+ * Compute SHA256 hash of dependencies in package.json (dependencies, devDependencies, overrides).
+ * Used to detect when CLI's pinSiteDependencies changes the lockfile — forces npm install.
+ */
+const computeDepsHash = (pkg) => {
+  const deps = {
+    dependencies: pkg.dependencies || {},
+    devDependencies: pkg.devDependencies || {},
+    overrides: pkg.overrides || {},
+  };
+  const hash = createHash("sha256");
+  hash.update(JSON.stringify(deps, Object.keys(deps).sort()));
+  return hash.digest("hex");
+};
+
+/**
+ * Check if dependencies have changed since the last install.
+ * Stores hash in node_modules/.ws-deps-hash. Returns true if reinstall is needed.
+ */
+const shouldReinstallDeps = async (nodeModulesPath, pkg) => {
+  const hashFile = join(nodeModulesPath, ".ws-deps-hash");
+  const currentHash = computeDepsHash(pkg);
+  try {
+    const storedHash = await readFile(hashFile, "utf8");
+    return storedHash.trim() !== currentHash;
+  } catch {
+    // File doesn't exist or can't be read — force install
+    return true;
+  }
+};
+
+/**
+ * Write the current deps hash after npm install succeeds.
+ */
+const updateDepsHash = async (nodeModulesPath, pkg) => {
+  const hashFile = join(nodeModulesPath, ".ws-deps-hash");
+  const hash = computeDepsHash(pkg);
+  await writeFile(hashFile, hash + "\n", "utf8");
+};
+
+// ─── Log management ────────────────────────────────────────────────────────────
+
+const PUBLISH_LOG_RETENTION = Math.max(1, Number.parseInt(process.env.PUBLISH_LOG_RETENTION ?? "5", 10) || 5);
+
+/**
+ * In-memory tracking of active publish logs (buildId → { domain, startedAt, lines, currentStage }).
+ * Persisted logs live in /var/work/<domain>/logs/<buildId>.log.
+ * Files are retained per domain (keep newest N builds).
+ */
+const activeLogs = new Map(); // buildId → { domain, startedAt, lines, currentStage }
+
+/**
+ * Record a log line during an active publish. Called by exec wrappers.
+ */
+const recordLogLine = (buildId, stage, text) => {
+  const existing = activeLogs.get(buildId);
+  if (!existing) return;
+  const timestamp = new Date().toISOString().slice(11, 19); // HH:MM:SS
+  const redacted = redactSecrets(text);
+  existing.lines.push(`[${timestamp}] [${stage}] ${redacted}`);
+};
+
+// Stages must match `failedStage` in the builder's publishLogOutput contract
+// (packages/trpc-interface/src/shared/deployment-contract.ts in webstudio-fork).
+const stageRules = [
+  [/\bcli\b.*\bsync\b/, "sync"],
+  [/\bcli\b.*\bbuild\b/, "project-build"],
+  [/\bnpm (install|ci)\b/, "setup"],
+  [/\bnpm run build\b|\bdocker (buildx )?build\b/, "application-build"],
+  [/\bwrangler\b|\brsync\b|\bssh\b|\bscp\b|\bdocker (push|compose|run|rm|stop)\b|\bcurl\b/, "deploy"],
+];
+
+const knownStages = new Set([
+  "setup",
+  "sync",
+  "project-build",
+  "application-build",
+  "worker-build",
+  "assets",
+  "deploy",
+  "finalize",
+]);
+
+const stageForCommand = (cmd) =>
+  stageRules.find(([pattern]) => pattern.test(cmd))?.[1];
+
+// Remember the stage of the command about to run, so a failure reports the
+// last stage that started.
+const markStage = (buildId, cmd) => {
+  const entry = activeLogs.get(buildId);
+  const stage = stageForCommand(cmd);
+  if (entry && stage) entry.currentStage = stage;
+};
+
+/**
+ * Start tracking a build's logs. Called at the start of each publish pipeline.
+ */
+const startLogCapture = (buildId, domain) => {
+  activeLogs.set(buildId, {
+    domain,
+    startedAt: new Date().toISOString(),
+    lines: [],
+    currentStage: undefined,
+  });
+};
+
+/**
+ * Complete and persist a build's logs to disk.
+ */
+const finishLogCapture = async (buildId, outcome, failedStage) => {
+  const entry = activeLogs.get(buildId);
+  if (!entry) return;
+
+  const { domain, startedAt, lines } = entry;
+  const completedAt = new Date().toISOString();
+
+  try {
+    const logsDir = join(WORK_DIR, domain, "logs");
+    await mkdir(logsDir, { recursive: true });
+
+    // Write log file (plain text, one line per exec)
+    const logPath = join(logsDir, `${buildId}.log`);
+    const logContent = lines.join("\n") + "\n";
+    await writeFile(logPath, logContent, "utf8");
+
+    // Write metadata file (JSON with timing and outcome)
+    const metaPath = join(logsDir, `${buildId}.json`);
+    const metadata = {
+      buildId,
+      startedAt,
+      completedAt,
+      outcome,
+      failedStage,
+    };
+    await writeFile(metaPath, JSON.stringify(metadata, null, 2) + "\n", "utf8");
+
+    log(`Persisted logs for ${buildId} (${domain}) — outcome: ${outcome}`);
+  } catch (err) {
+    logErr(`Failed to persist logs for ${buildId}: ${err.message}`);
+  }
+
+  activeLogs.delete(buildId);
+
+  // Enforce retention: keep only N newest builds per domain
+  try {
+    const logsDir = join(WORK_DIR, domain, "logs");
+    const entries = await readdir(logsDir);
+    const metaFiles = entries
+      .filter((name) => name.endsWith(".json"))
+      .map((name) => ({
+        name: name.slice(0, -5), // remove .json
+        stat: null,
+      }));
+
+    // Load mtime of each .log file to determine age
+    const withMtime = await Promise.all(
+      metaFiles.map(async (entry) => {
+        try {
+          const st = await stat(join(logsDir, entry.name + ".log"));
+          return { ...entry, mtime: st.mtimeMs };
+        } catch {
+          return { ...entry, mtime: 0 };
+        }
+      })
+    );
+
+    // Sort by mtime descending (newest first) and delete oldest
+    withMtime.sort((a, b) => b.mtime - a.mtime);
+    for (let i = PUBLISH_LOG_RETENTION; i < withMtime.length; i++) {
+      const name = withMtime[i].name;
+      try {
+        await rm(join(logsDir, `${name}.log`));
+        await rm(join(logsDir, `${name}.json`));
+      } catch {}
+    }
+  } catch {}
+};
+
+/**
+ * Read a build's logs from disk and encode as base64url in chunks.
+ */
+const readPublishLog = async (buildId, domain, cursor) => {
+  try {
+    const logsDir = join(WORK_DIR, domain, "logs");
+    const metaPath = join(logsDir, `${buildId}.json`);
+    const logPath = join(logsDir, `${buildId}.log`);
+
+    // Check if metadata exists
+    try {
+      await access(metaPath);
+    } catch {
+      return { availability: "unavailable" };
+    }
+
+    // Read metadata
+    const metaContent = await readFile(metaPath, "utf8");
+    const meta = JSON.parse(metaContent);
+    const { startedAt, completedAt, outcome, failedStage } = meta;
+
+    // Read log file
+    const logContent = await readFile(logPath, "utf8");
+    const logLines = logContent.trim().split("\n");
+
+    // Encode log in base64url, with pagination support
+    const CHUNK_SIZE = 300_000; // bytes of base64url (≈ 225 KB of raw text)
+    const encoded = Buffer.from(logContent).toString("base64url");
+    const chunk = encoded.slice(cursor ?? 0, (cursor ?? 0) + CHUNK_SIZE);
+    const complete = !chunk || (cursor ?? 0) + CHUNK_SIZE >= encoded.length;
+    const nextCursor = complete ? undefined : (cursor ?? 0) + CHUNK_SIZE;
+
+    return {
+      availability: "available",
+      outcome,
+      logAvailability: "available",
+      startedAt,
+      completedAt,
+      failedStage: knownStages.has(failedStage) ? failedStage : undefined,
+      log: {
+        encoding: "base64url",
+        chunk,
+        complete,
+        nextCursor,
+      },
+    };
+  } catch (err) {
+    logErr(`Failed to read logs for ${buildId}: ${err.message}`);
+    return { availability: "unavailable" };
+  }
+};
 
 // ─── Docker container management ─────────────────────────────────────────────
 
@@ -691,15 +922,43 @@ const publishBuildCloudflare = async ({ buildId }) => {
   const workDir = join(WORK_DIR, domain);
   await mkdir(workDir, { recursive: true });
 
-  const run = async (cmd, extraEnv = {}) => {
-    log(`  $ ${redactSecrets(cmd)}`);
-    const { stdout, stderr } = await execAsync(cmd, {
-      cwd: workDir,
-      maxBuffer: 10 * 1024 * 1024,
-      env: { ...process.env, ...extraEnv },
-    });
-    if (stdout) log(`  stdout: ${redactSecrets(stdout.trim())}`);
-    if (stderr) log(`  stderr: ${redactSecrets(stderr.trim())}`);
+  const run = async (cmd, extraEnv = {}, stage = "build") => {
+    const redactedCmd = redactSecrets(cmd);
+    log(`  $ ${redactedCmd}`);
+    recordLogLine(buildId, stage, `$ ${redactedCmd}`);
+    markStage(buildId, cmd);
+    try {
+      const { stdout, stderr } = await execAsync(cmd, {
+        cwd: workDir,
+        maxBuffer: 10 * 1024 * 1024,
+        env: { ...process.env, ...extraEnv },
+      });
+      if (stdout) {
+        const trimmedOut = redactSecrets(stdout.trim());
+        log(`  stdout: ${trimmedOut}`);
+        recordLogLine(buildId, stage, trimmedOut);
+      }
+      if (stderr) {
+        const trimmedErr = redactSecrets(stderr.trim());
+        log(`  stderr: ${trimmedErr}`);
+        recordLogLine(buildId, stage, trimmedErr);
+      }
+    } catch (err) {
+      // Capture stdout/stderr from the failed command
+      const stdout = err.stdout || "";
+      const stderr = err.stderr || "";
+      if (stdout) {
+        const trimmedOut = redactSecrets(stdout.trim());
+        log(`  stdout: ${trimmedOut}`);
+        recordLogLine(buildId, stage, trimmedOut);
+      }
+      if (stderr) {
+        const trimmedErr = redactSecrets(stderr.trim());
+        log(`  stderr: ${trimmedErr}`);
+        recordLogLine(buildId, stage, trimmedErr);
+      }
+      throw err;
+    }
   };
 
   // Handle mode transitions → cloudflare. Without this a site that was
@@ -756,6 +1015,23 @@ const publishBuildCloudflare = async ({ buildId }) => {
     await pinSiteDependencies(workDir);
     log(`Installing dependencies for ${domain}...`);
     await run(`npm install`);
+    const packageJsonPath = join(workDir, "package.json");
+    const pkg = JSON.parse(await readFile(packageJsonPath, "utf8"));
+    await updateDepsHash(nodeModulesPath, pkg);
+  } else {
+    // Check if template CLI changed dependencies (e.g., added lottie-web)
+    try {
+      const packageJsonPath = join(workDir, "package.json");
+      const pkg = JSON.parse(await readFile(packageJsonPath, "utf8"));
+      if (await shouldReinstallDeps(nodeModulesPath, pkg)) {
+        log(`  Dependencies changed — reinstalling`);
+        await rm(nodeModulesPath, { recursive: true, force: true });
+        await run(`npm install`);
+        await updateDepsHash(nodeModulesPath, pkg);
+      }
+    } catch (err) {
+      logErr(`Error checking dependencies for ${domain}: ${err.message}`);
+    }
   }
 
   // 4. Build with Remix/Vite
@@ -812,15 +1088,43 @@ const publishBuildCloudflare = async ({ buildId }) => {
  * absolute). Returns the dist dir.
  */
 const buildSsgOutput = async ({ buildId, domain, workDir, publicOrigin }) => {
-  const run = async (cmd, extraEnv = {}) => {
-    log(`  $ ${redactSecrets(cmd)}`);
-    const { stdout, stderr } = await execAsync(cmd, {
-      cwd: workDir,
-      maxBuffer: 10 * 1024 * 1024,
-      env: { ...process.env, ...extraEnv },
-    });
-    if (stdout) log(`  stdout: ${redactSecrets(stdout.trim())}`);
-    if (stderr) log(`  stderr: ${redactSecrets(stderr.trim())}`);
+  const run = async (cmd, extraEnv = {}, stage = "build") => {
+    const redactedCmd = redactSecrets(cmd);
+    log(`  $ ${redactedCmd}`);
+    recordLogLine(buildId, stage, `$ ${redactedCmd}`);
+    markStage(buildId, cmd);
+    try {
+      const { stdout, stderr } = await execAsync(cmd, {
+        cwd: workDir,
+        maxBuffer: 10 * 1024 * 1024,
+        env: { ...process.env, ...extraEnv },
+      });
+      if (stdout) {
+        const trimmedOut = redactSecrets(stdout.trim());
+        log(`  stdout: ${trimmedOut}`);
+        recordLogLine(buildId, stage, trimmedOut);
+      }
+      if (stderr) {
+        const trimmedErr = redactSecrets(stderr.trim());
+        log(`  stderr: ${trimmedErr}`);
+        recordLogLine(buildId, stage, trimmedErr);
+      }
+    } catch (err) {
+      // Capture stdout/stderr from the failed command
+      const stdout = err.stdout || "";
+      const stderr = err.stderr || "";
+      if (stdout) {
+        const trimmedOut = redactSecrets(stdout.trim());
+        log(`  stdout: ${trimmedOut}`);
+        recordLogLine(buildId, stage, trimmedOut);
+      }
+      if (stderr) {
+        const trimmedErr = redactSecrets(stderr.trim());
+        log(`  stderr: ${trimmedErr}`);
+        recordLogLine(buildId, stage, trimmedErr);
+      }
+      throw err;
+    }
   };
 
   // 1. Sync build data (via URL interne Docker, pas besoin de passer par Traefik/TLS)
@@ -898,6 +1202,22 @@ const buildSsgOutput = async ({ buildId, domain, workDir, publicOrigin }) => {
     await pinSiteDependencies(workDir);
     log(`Installing dependencies for ${domain}...`);
     await run(`npm install`);
+    const pkg = JSON.parse(await readFile(packageJsonPath, "utf8"));
+    await updateDepsHash(nodeModulesPath, pkg);
+  } else {
+    // Check if template CLI changed dependencies (e.g., added lottie-web)
+    try {
+      const pkg = JSON.parse(await readFile(packageJsonPath, "utf8"));
+      if (await shouldReinstallDeps(nodeModulesPath, pkg)) {
+        log(`  Dependencies changed — reinstalling`);
+        await rm(nodeModulesPath, { recursive: true, force: true });
+        await pinSiteDependencies(workDir);
+        await run(`npm install`);
+        await updateDepsHash(nodeModulesPath, pkg);
+      }
+    } catch (err) {
+      logErr(`Error checking dependencies for ${domain}: ${err.message}`);
+    }
   }
 
   // 4. Build static HTML with Vite + vike prerender
@@ -1214,15 +1534,43 @@ const buildDockerImage = async ({
   imageTag,
   hostnames = [],
 }) => {
-  const run = async (cmd, extraEnv = {}) => {
-    log(`  $ ${redactSecrets(cmd)}`);
-    const { stdout, stderr } = await execAsync(cmd, {
-      cwd: workDir,
-      maxBuffer: 10 * 1024 * 1024,
-      env: { ...process.env, ...extraEnv },
-    });
-    if (stdout) log(`  stdout: ${redactSecrets(stdout.trim())}`);
-    if (stderr) log(`  stderr: ${redactSecrets(stderr.trim())}`);
+  const run = async (cmd, extraEnv = {}, stage = "build") => {
+    const redactedCmd = redactSecrets(cmd);
+    log(`  $ ${redactedCmd}`);
+    recordLogLine(buildId, stage, `$ ${redactedCmd}`);
+    markStage(buildId, cmd);
+    try {
+      const { stdout, stderr } = await execAsync(cmd, {
+        cwd: workDir,
+        maxBuffer: 10 * 1024 * 1024,
+        env: { ...process.env, ...extraEnv },
+      });
+      if (stdout) {
+        const trimmedOut = redactSecrets(stdout.trim());
+        log(`  stdout: ${trimmedOut}`);
+        recordLogLine(buildId, stage, trimmedOut);
+      }
+      if (stderr) {
+        const trimmedErr = redactSecrets(stderr.trim());
+        log(`  stderr: ${trimmedErr}`);
+        recordLogLine(buildId, stage, trimmedErr);
+      }
+    } catch (err) {
+      // Capture stdout/stderr from the failed command
+      const stdout = err.stdout || "";
+      const stderr = err.stderr || "";
+      if (stdout) {
+        const trimmedOut = redactSecrets(stdout.trim());
+        log(`  stdout: ${trimmedOut}`);
+        recordLogLine(buildId, stage, trimmedOut);
+      }
+      if (stderr) {
+        const trimmedErr = redactSecrets(stderr.trim());
+        log(`  stderr: ${trimmedErr}`);
+        recordLogLine(buildId, stage, trimmedErr);
+      }
+      throw err;
+    }
   };
 
   // Drop a stale .dockerignore left by a previous ssg:coolify publish — this
@@ -1360,15 +1708,43 @@ const publishBuildSsr = async ({ buildId }) => {
   const workDir = join(WORK_DIR, domain);
   await mkdir(workDir, { recursive: true });
 
-  const run = async (cmd, extraEnv = {}) => {
-    log(`  $ ${cmd}`);
-    const { stdout, stderr } = await execAsync(cmd, {
-      cwd: workDir,
-      maxBuffer: 10 * 1024 * 1024,
-      env: { ...process.env, ...extraEnv },
-    });
-    if (stdout) log(`  stdout: ${stdout.trim()}`);
-    if (stderr) log(`  stderr: ${stderr.trim()}`);
+  const run = async (cmd, extraEnv = {}, stage = "build") => {
+    const redactedCmd = redactSecrets(cmd);
+    log(`  $ ${redactedCmd}`);
+    recordLogLine(buildId, stage, `$ ${redactedCmd}`);
+    markStage(buildId, cmd);
+    try {
+      const { stdout, stderr } = await execAsync(cmd, {
+        cwd: workDir,
+        maxBuffer: 10 * 1024 * 1024,
+        env: { ...process.env, ...extraEnv },
+      });
+      if (stdout) {
+        const trimmedOut = redactSecrets(stdout.trim());
+        log(`  stdout: ${trimmedOut}`);
+        recordLogLine(buildId, stage, trimmedOut);
+      }
+      if (stderr) {
+        const trimmedErr = redactSecrets(stderr.trim());
+        log(`  stderr: ${trimmedErr}`);
+        recordLogLine(buildId, stage, trimmedErr);
+      }
+    } catch (err) {
+      // Capture stdout/stderr from the failed command
+      const stdout = err.stdout || "";
+      const stderr = err.stderr || "";
+      if (stdout) {
+        const trimmedOut = redactSecrets(stdout.trim());
+        log(`  stdout: ${trimmedOut}`);
+        recordLogLine(buildId, stage, trimmedOut);
+      }
+      if (stderr) {
+        const trimmedErr = redactSecrets(stderr.trim());
+        log(`  stderr: ${trimmedErr}`);
+        recordLogLine(buildId, stage, trimmedErr);
+      }
+      throw err;
+    }
   };
 
   // Handle mode transitions → docker
@@ -1630,15 +2006,31 @@ const deployImageToCoolify = async ({
   }
 };
 
-const runInWorkDir = (workDir) => async (cmd, extraEnv = {}) => {
-  log(`  $ ${redactSecrets(cmd)}`);
-  const { stdout, stderr } = await execAsync(cmd, {
-    cwd: workDir,
-    maxBuffer: 10 * 1024 * 1024,
-    env: { ...process.env, ...extraEnv },
-  });
-  if (stdout) log(`  stdout: ${redactSecrets(stdout.trim())}`);
-  if (stderr) log(`  stderr: ${redactSecrets(stderr.trim())}`);
+const runInWorkDir = (workDir, buildId) => async (cmd, extraEnv = {}) => {
+  const redactedCmd = redactSecrets(cmd);
+  log(`  $ ${redactedCmd}`);
+  recordLogLine(buildId, "build", `$ ${redactedCmd}`);
+  markStage(buildId, cmd);
+  const record = ({ stdout, stderr }) => {
+    for (const [label, output] of [["stdout", stdout], ["stderr", stderr]]) {
+      if (!output) continue;
+      const trimmed = redactSecrets(output.trim());
+      log(`  ${label}: ${trimmed}`);
+      recordLogLine(buildId, "build", trimmed);
+    }
+  };
+  try {
+    record(
+      await execAsync(cmd, {
+        cwd: workDir,
+        maxBuffer: 10 * 1024 * 1024,
+        env: { ...process.env, ...extraEnv },
+      })
+    );
+  } catch (err) {
+    record({ stdout: err.stdout, stderr: err.stderr });
+    throw err;
+  }
 };
 
 /**
@@ -1659,7 +2051,7 @@ const publishBuildCoolifySsr = async ({
   const publishDomain = qualifyPublishDomain(domain);
   const workDir = join(WORK_DIR, domain);
   await mkdir(workDir, { recursive: true });
-  const run = runInWorkDir(workDir);
+  const run = runInWorkDir(workDir, buildId);
   const stateFile = join(workDir, "state.json");
 
   await stopLocalServing({ domain, stateFile, publishDomain, customDomains });
@@ -1738,7 +2130,7 @@ const publishBuildCoolifySsg = async ({
   const publishDomain = qualifyPublishDomain(domain);
   const workDir = join(WORK_DIR, domain);
   await mkdir(workDir, { recursive: true });
-  const run = runInWorkDir(workDir);
+  const run = runInWorkDir(workDir, buildId);
   const stateFile = join(workDir, "state.json");
 
   await stopLocalServing({ domain, stateFile, publishDomain, customDomains });
@@ -2089,14 +2481,19 @@ const server = createServer(async (req, res) => {
         return;
       }
 
+      // logHandle is simply the buildId (used by GET /logs to identify the build)
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: true }));
+      res.end(JSON.stringify({ success: true, logHandle: buildId }));
 
       const tempDomainKey = `${builderOrigin}:${buildId}`;
       const q = getProjectQueue(tempDomainKey);
 
       q.current = q.current
         .then(async () => {
+          // Start log capture before acquiring the publish slot
+          const { projectDomain: domain } = await getProjectBuildInfo(buildId);
+          startLogCapture(buildId, domain);
+
           await acquirePublishSlot();
           try {
             await runner({
@@ -2105,6 +2502,16 @@ const server = createServer(async (req, res) => {
               coolifyWebhookUrl: input.coolifyWebhookUrl,
               coolifyWebhookToken: input.coolifyWebhookToken,
             });
+            // Publish succeeded
+            await finishLogCapture(buildId, "succeeded", null);
+          } catch (err) {
+            // Publish failed — try to record the failure
+            await finishLogCapture(
+              buildId,
+              "failed",
+              activeLogs.get(buildId)?.currentStage
+            );
+            throw err;
           } finally {
             releasePublishSlot();
           }
@@ -2244,6 +2651,51 @@ const server = createServer(async (req, res) => {
         res.end(JSON.stringify({ success: false, error: error.message }));
       }
     });
+    return;
+  }
+
+  if (req.method === "GET" && req.url.startsWith("/logs/")) {
+    const buildId = req.url.slice(6).split("?")[0];
+    const query = new URLSearchParams(req.url.split("?")[1] ?? "");
+    const cursor = query.get("cursor") ? Number.parseInt(query.get("cursor"), 10) : undefined;
+    const includeLog = query.get("includeLog") === "true";
+
+    // Verify auth token
+    const auth = req.headers.authorization ?? "";
+    if (!auth.startsWith("Bearer ") || auth.slice(7) !== SERVICE_TOKEN) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized" }));
+      return;
+    }
+
+    if (!buildId || buildId.length === 0) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Missing buildId" }));
+      return;
+    }
+
+    // Check if build is currently active (pending)
+    const activeLog = activeLogs.get(buildId);
+    if (activeLog) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ availability: "pending" }));
+      return;
+    }
+
+    // Check if build is recorded (get domain from builder)
+    (async () => {
+      try {
+        const { projectDomain: domain } = await getProjectBuildInfo(buildId);
+        const result = includeLog
+          ? await readPublishLog(buildId, domain, cursor)
+          : { availability: "available" }; // minimal response if not requesting log
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ availability: "unavailable" }));
+      }
+    })();
     return;
   }
 
