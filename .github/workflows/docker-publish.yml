@@ -28,12 +28,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ARM64 support via QEMU (enables Raspberry Pi builds)
+      # ARM64 for Raspberry Pi
       - uses: docker/setup-qemu-action@v3
 
       - uses: docker/setup-buildx-action@v3
 
-      # Login to GitHub Container Registry
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -41,7 +40,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Sanitize branch name for use as image tag (pull_request and workflow_dispatch).
       - name: Compute branch tag
         id: branch
         env:
@@ -67,12 +65,7 @@ jobs:
           echo "Image tag: $SAFE"
           echo "tag=$SAFE" >> "$GITHUB_OUTPUT"
 
-      # Derive image tags:
-      #   push to main                           → :latest
-      #   workflow_dispatch on main              → :latest
-      #   workflow_dispatch on other branch      → :<sanitized-branch>
-      #   pull_request                           → :<sanitized-branch>
-      #   published release                      → :<version> + :latest
+      # main → :latest, other branch or PR → :<branch>, release → :<version> + :latest
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -97,10 +90,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # For PRs, comment with the publisher image tag and digest so the branch can be
-  # tested on the Coolify test stack. Upsert into an existing comment so each
-  # synchronize event updates the same comment instead of spamming (marker:
-  # <!-- test-images -->). Skip for PRs from external forks (readonly token).
+  # Posts the test image tag on the PR, updating one comment (<!-- test-images -->).
+  # Skipped for external forks (read-only token).
   comment-pr:
     name: Comment PR with publisher image
     runs-on: ubuntu-24.04

@@ -1,115 +1,79 @@
 # webstudio-publisher
 
-Self-hosted publisher service for [Webstudio](https://webstudio.is).
+Self-hosted publisher for [Webstudio](https://webstudio.is). When a user clicks
+**Publish** in the builder, it builds the site and serves it locally (SSG or SSR)
+or ships it to Cloudflare Pages, a server over SSH, or a remote Coolify.
 
-When a user clicks **Publish** in the Webstudio builder, this service:
-1. Fetches build data from the builder via its REST API
-2. Runs `webstudio sync` + `webstudio build --template ssg` to generate a static site
-3. Runs `vite build` to produce static HTML files
-4. Writes the output to `/var/publish/<domain>/` so Nginx can serve it
-
-## Docker images
-
-Images are published automatically on every push to `main` and on releases:
-
-| Registry | Image |
-|----------|-------|
-| GitHub Container Registry | `ghcr.io/webstudio-community/webstudio-publisher:latest` |
-| Docker Hub | `webstudio-community/webstudio-publisher:latest` |
-
-## Usage
-
-This service is meant to be used alongside the Webstudio builder. See
+It runs alongside the builder: see
 [webstudio-self-host](https://github.com/webstudio-community/webstudio-self-host)
 for the full Docker Compose setup.
+
+Image: `ghcr.io/webstudio-community/webstudio-publisher:latest` (built on every
+push to `main` and on releases).
 
 ## Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TRPC_SERVER_API_TOKEN` | — | Service token to authenticate with the builder app |
-| `BUILDER_INTERNAL_URL` | `http://app:3000` | Internal Docker URL for the builder (avoids Traefik/TLS) |
-| `PUBLISHER_HOST` | — | Domain suffix for slug-based URLs (e.g. `example.com` → `myproject.example.com`) |
-| `PORT` | `4000` | HTTP port |
-| `MAX_CONCURRENT_PUBLISHES` | `0` (unlimited) | Max publishes running at once across all sites; extra ones wait in a FIFO queue. Set to `1` on small machines (e.g. Raspberry Pi) |
-| `CONTAINER_READY_TIMEOUT_MS` | `60000` | SSR: max wait for a newly published container to answer before the publish fails and the previous version stays online |
-| `REGISTRY_URL` | — | Registry to push images to for `host: "coolify"` (e.g. `ghcr.io/my-org`) — enables the `ssr:coolify` and `ssg:coolify` targets |
-| `REGISTRY_USER` / `REGISTRY_TOKEN` | — | Registry write credentials (if private) |
+| `TRPC_SERVER_API_TOKEN` | — | Service token shared with the builder |
+| `BUILDER_INTERNAL_URL` | `http://app:3000` | Internal URL of the builder (avoids Traefik/TLS) |
+| `PUBLISHER_HOST` | — | Domain suffix for slug URLs (`example.com` → `myproject.example.com`) |
+| `PORT` | `4000` | Build API port |
+| `PROXY_PORT` | `4001` | Site proxy port: route `*.PUBLISHER_HOST` here |
+| `DOCKER_NETWORK` | auto-detected | Network shared with SSR site containers |
+| `TRAEFIK_DYNAMIC_DIR` | — | Traefik file-provider directory; enables Let's Encrypt for custom domains |
+| `MAX_CONCURRENT_PUBLISHES` | `0` (unlimited) | Publishes running at once; extra ones queue. Use `1` on small machines |
+| `CONTAINER_READY_TIMEOUT_MS` | `60000` | SSR: wait for a new container before keeping the previous one online |
+| `PUBLISH_LOG_RETENTION` | `5` | Publish logs kept per domain |
+| `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` | — | Enable `host: "cloudflare"` |
+| `CLOUDFLARE_PRODUCTION_BRANCH` | `main` | Production branch of created Pages projects |
+| `REGISTRY_URL` | — | Registry for `host: "coolify"` images (e.g. `ghcr.io/my-org`) |
+| `REGISTRY_USER` / `REGISTRY_TOKEN` | — | Registry write credentials, if private |
 
-## Building locally
-
-```bash
-docker build -t webstudio-publisher .
-```
+SSR mode needs `/var/run/docker.sock` mounted.
 
 ## API
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/publish` | Trigger a publish. Body: `{ "buildId", "builderOrigin", "renderMode": "ssg" \| "ssr", "host": "local" \| "cloudflare" \| "ssh" \| "coolify" }` (+ `coolifyWebhookUrl` / `coolifyWebhookToken?` for `host: "coolify"`; legacy `"buildMode"` still accepted) |
-| `POST` | `/targets/ssh-setup` | Configure the SSH target for a domain (`host: "ssh"`). Body: `{ "domain", "sshHost", "sshUser", "sshPath", "sshPort"?, "sshPrivateKey", "publicUrl"? }` |
-| `POST` | `/unpublish` | Take a hostname down. Body: `{ "domain": "..." }` |
-| `GET` | `/capabilities` | Publisher capabilities — `{ "cloudflare": bool, "coolify": bool, "ssh": bool, "targets": ["ssg:local", …] }` |
-| `GET` | `/health` | Health check — returns `ok` |
+| `POST` | `/publish` | Body: `{ buildId, builderOrigin, renderMode: "ssg" \| "ssr", host: "local" \| "cloudflare" \| "ssh" \| "coolify" }`, plus `coolifyWebhookUrl` / `coolifyWebhookToken?` for Coolify. Legacy `buildMode` still accepted. Returns `{ success, logHandle }` |
+| `GET` | `/logs/<buildId>` | Publish status and log (`?includeLog=true&cursor=…`, base64url chunks). Bearer token required |
+| `POST` | `/targets/ssh-setup` | Body: `{ domain, sshHost, sshUser, sshPath, sshPort?, sshPrivateKey, publicUrl? }` |
+| `POST` | `/unpublish` | Body: `{ domain }` |
+| `GET` | `/capabilities` | `{ cloudflare, coolify, ssh, targets: ["ssg:local", …] }` |
+| `GET` | `/health` | Returns `ok` |
 
-### `host: "ssh"` — deploy an SSG site to a remote server
+### `host: "ssh"`
 
-Configure the target once, then publish with `renderMode: "ssg"`, `host: "ssh"`:
+Register the target once per site, then publish with `renderMode: "ssg"`:
 
 ```bash
-# 1. generate a keypair and authorize it on the remote server
 ssh-keygen -t ed25519 -f ./ws_deploy -N ''
 ssh-copy-id -i ./ws_deploy.pub deploy@my-server
 
-# 2. register the target with the publisher (once per site)
 curl -X POST http://publisher:4000/targets/ssh-setup \
   -H 'content-type: application/json' \
   -d "{\"domain\":\"my-site\",\"sshHost\":\"my-server\",\"sshUser\":\"deploy\",\"sshPath\":\"/var/www/my-site\",\"sshPrivateKey\":\"$(awk '{printf "%s\\n", $0}' ./ws_deploy)\",\"publicUrl\":\"https://my-site.com\"}"
 ```
 
-Each publish runs `rsync -az --delete` from the freshly built `dist/client/` to
-`sshUser@sshHost:sshPath/`. TLS and web-server config on the remote host are the
-user's responsibility; the publisher does not serve the site or manage its domain.
+Each publish runs `rsync -az --delete dist/client/ sshUser@sshHost:sshPath/`.
+TLS and the web server on the remote host are up to you.
 
-### SSR form submissions and allowed origins
+### `host: "coolify"`
 
-React Router 7 refuses a form submission (`POST`) whose `Origin` header does not
-match the URL it sees, and behind the TLS-terminating proxy the site container
-only sees plain `http`. For every SSR site (`host: "local"` and `"coolify"`) the
-publisher therefore writes a `react-router.config.ts` with
-`allowedActionOrigins` set to the site's hostnames (the staging domain + its
-custom domains). Without it, every Webhook Form on the site answers `400`.
+Set `REGISTRY_URL` on the publisher. On the target Coolify, create a **Docker
+Image** app pulling `${REGISTRY_URL}/ws-<project-slug>` (port `3000` for SSR,
+`80` for SSG) and pass its deploy webhook URL with each publish.
 
-The list is fixed at build time: a custom domain added after a publish only
-accepts form submissions after the next publish. Other origins stay rejected.
+Each publish pushes `:latest` and `:<buildId>`, then calls the webhook. A `2xx`
+means the deploy is queued; the publisher never polls Coolify. Unpublishing
+leaves the Coolify app and the images in place.
 
-### Patches applied to SSR sites
+### SSR sites
 
-Sites install `@webstudio-is/sdk-components-react-router` from the upstream npm
-registry, so fixes made in the fork's copy never reach them. The publisher
-patches the compiled package inside the site's `docker build` instead
-(`patch-navlink.cjs`). The script only writes when its pattern matches, so an
-upstream change leaves the package untouched.
-
-- **NavLink** — a `/#section` link is only marked active (`aria-current="page"`)
-  when the current URL has the same anchor; a plain `/` link stays active on its
-  page. Applied to the client bundle and to the runtime `node_modules` used by
-  the SSR server. A visible `⚠️` warning is logged if the pattern is not found.
-
-### `host: "coolify"` — deploy to a remote Coolify (SSR or SSG)
-
-Set `REGISTRY_URL` (+ `REGISTRY_USER` / `REGISTRY_TOKEN` if private) on the
-publisher. On the target Coolify, the site owner creates a **Docker Image**
-application pulling `${REGISTRY_URL}/ws-<project-slug>` (port `3000` for SSR,
-`80` for SSG), and copies its **deploy webhook URL**.
-
-Each publish then:
-
-- **SSR** — `docker build` the react-router image
-- **SSG** — prerender, then wrap `dist/client` in a tiny `nginx:alpine` image
-
-→ push `${REGISTRY_URL}/ws-<slug>:latest` (+ `:<buildId>`) → `POST` the webhook
-(with a `Bearer` token if given) so Coolify pulls the new image and redeploys.
-The publisher never talks to the Coolify API directly and never polls — a `2xx`
-from the webhook means the deploy is queued. `unpublish` forgets the site
-locally; the Coolify app and the registry images are left in place.
+- Form submissions are allowed from the site's hostnames only
+  (`allowedActionOrigins`). A custom domain added after a publish accepts forms
+  after the next publish.
+- Sites install `@webstudio-is/sdk-components-react-router` from npm, so the
+  build patches it (`patch-navlink.cjs`): a `/#section` link is active only on
+  that anchor. Nothing is written if the pattern is not found.
