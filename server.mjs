@@ -42,6 +42,7 @@ import { mkdir, cp, rm, rename, access, readdir, readFile, writeFile, stat, chmo
 import { join, extname, dirname, basename } from "node:path";
 import { promisify } from "node:util";
 import { networkInterfaces } from "node:os";
+import { createHash } from "node:crypto";
 
 const execAsync = promisify(exec);
 
@@ -103,6 +104,46 @@ const SECRETS = [
 const redactSecrets = (text) =>
   SECRETS.reduce((acc, [secret, mask]) => acc.replaceAll(secret, mask), String(text));
 
+/**
+ * Compute SHA256 hash of dependencies in package.json (dependencies, devDependencies, overrides).
+ * Used to detect when CLI's pinSiteDependencies changes the lockfile — forces npm install.
+ */
+const computeDepsHash = (pkg) => {
+  const deps = {
+    dependencies: pkg.dependencies || {},
+    devDependencies: pkg.devDependencies || {},
+    overrides: pkg.overrides || {},
+  };
+  const hash = createHash("sha256");
+  hash.update(JSON.stringify(deps, Object.keys(deps).sort()));
+  return hash.digest("hex");
+};
+
+/**
+ * Check if dependencies have changed since the last install.
+ * Stores hash in node_modules/.ws-deps-hash. Returns true if reinstall is needed.
+ */
+const shouldReinstallDeps = async (nodeModulesPath, pkg) => {
+  const hashFile = join(nodeModulesPath, ".ws-deps-hash");
+  const currentHash = computeDepsHash(pkg);
+  try {
+    const storedHash = await readFile(hashFile, "utf8");
+    return storedHash.trim() !== currentHash;
+  } catch {
+    // File doesn't exist or can't be read — force install
+    return true;
+  }
+};
+
+/**
+ * Write the current deps hash after npm install succeeds.
+ */
+const updateDepsHash = async (nodeModulesPath, pkg) => {
+  const hashFile = join(nodeModulesPath, ".ws-deps-hash");
+  const hash = computeDepsHash(pkg);
+  await writeFile(hashFile, hash + "\n", "utf8");
+};
+
 // ─── Log management ────────────────────────────────────────────────────────────
 
 const PUBLISH_LOG_RETENTION = Math.max(1, Number.parseInt(process.env.PUBLISH_LOG_RETENTION ?? "5", 10) || 5);
@@ -141,10 +182,10 @@ const startLogCapture = (buildId, domain) => {
  * Complete and persist a build's logs to disk.
  */
 const finishLogCapture = async (buildId, outcome, failedStage) => {
-  const log = activeLogs.get(buildId);
-  if (!log) return;
+  const entry = activeLogs.get(buildId);
+  if (!entry) return;
 
-  const { domain, startedAt, lines } = log;
+  const { domain, startedAt, lines } = entry;
   const completedAt = new Date().toISOString();
 
   try {
@@ -853,20 +894,37 @@ const publishBuildCloudflare = async ({ buildId }) => {
     const redactedCmd = redactSecrets(cmd);
     log(`  $ ${redactedCmd}`);
     recordLogLine(buildId, stage, `$ ${redactedCmd}`);
-    const { stdout, stderr } = await execAsync(cmd, {
-      cwd: workDir,
-      maxBuffer: 10 * 1024 * 1024,
-      env: { ...process.env, ...extraEnv },
-    });
-    if (stdout) {
-      const trimmedOut = redactSecrets(stdout.trim());
-      log(`  stdout: ${trimmedOut}`);
-      recordLogLine(buildId, stage, trimmedOut);
-    }
-    if (stderr) {
-      const trimmedErr = redactSecrets(stderr.trim());
-      log(`  stderr: ${trimmedErr}`);
-      recordLogLine(buildId, stage, trimmedErr);
+    try {
+      const { stdout, stderr } = await execAsync(cmd, {
+        cwd: workDir,
+        maxBuffer: 10 * 1024 * 1024,
+        env: { ...process.env, ...extraEnv },
+      });
+      if (stdout) {
+        const trimmedOut = redactSecrets(stdout.trim());
+        log(`  stdout: ${trimmedOut}`);
+        recordLogLine(buildId, stage, trimmedOut);
+      }
+      if (stderr) {
+        const trimmedErr = redactSecrets(stderr.trim());
+        log(`  stderr: ${trimmedErr}`);
+        recordLogLine(buildId, stage, trimmedErr);
+      }
+    } catch (err) {
+      // Capture stdout/stderr from the failed command
+      const stdout = err.stdout || "";
+      const stderr = err.stderr || "";
+      if (stdout) {
+        const trimmedOut = redactSecrets(stdout.trim());
+        log(`  stdout: ${trimmedOut}`);
+        recordLogLine(buildId, stage, trimmedOut);
+      }
+      if (stderr) {
+        const trimmedErr = redactSecrets(stderr.trim());
+        log(`  stderr: ${trimmedErr}`);
+        recordLogLine(buildId, stage, trimmedErr);
+      }
+      throw err;
     }
   };
 
@@ -924,6 +982,23 @@ const publishBuildCloudflare = async ({ buildId }) => {
     await pinSiteDependencies(workDir);
     log(`Installing dependencies for ${domain}...`);
     await run(`npm install`);
+    const packageJsonPath = join(workDir, "package.json");
+    const pkg = JSON.parse(await readFile(packageJsonPath, "utf8"));
+    await updateDepsHash(nodeModulesPath, pkg);
+  } else {
+    // Check if template CLI changed dependencies (e.g., added lottie-web)
+    try {
+      const packageJsonPath = join(workDir, "package.json");
+      const pkg = JSON.parse(await readFile(packageJsonPath, "utf8"));
+      if (await shouldReinstallDeps(nodeModulesPath, pkg)) {
+        log(`  Dependencies changed — reinstalling`);
+        await rm(nodeModulesPath, { recursive: true, force: true });
+        await run(`npm install`);
+        await updateDepsHash(nodeModulesPath, pkg);
+      }
+    } catch (err) {
+      logErr(`Error checking dependencies for ${domain}: ${err.message}`);
+    }
   }
 
   // 4. Build with Remix/Vite
@@ -984,20 +1059,37 @@ const buildSsgOutput = async ({ buildId, domain, workDir, publicOrigin }) => {
     const redactedCmd = redactSecrets(cmd);
     log(`  $ ${redactedCmd}`);
     recordLogLine(buildId, stage, `$ ${redactedCmd}`);
-    const { stdout, stderr } = await execAsync(cmd, {
-      cwd: workDir,
-      maxBuffer: 10 * 1024 * 1024,
-      env: { ...process.env, ...extraEnv },
-    });
-    if (stdout) {
-      const trimmedOut = redactSecrets(stdout.trim());
-      log(`  stdout: ${trimmedOut}`);
-      recordLogLine(buildId, stage, trimmedOut);
-    }
-    if (stderr) {
-      const trimmedErr = redactSecrets(stderr.trim());
-      log(`  stderr: ${trimmedErr}`);
-      recordLogLine(buildId, stage, trimmedErr);
+    try {
+      const { stdout, stderr } = await execAsync(cmd, {
+        cwd: workDir,
+        maxBuffer: 10 * 1024 * 1024,
+        env: { ...process.env, ...extraEnv },
+      });
+      if (stdout) {
+        const trimmedOut = redactSecrets(stdout.trim());
+        log(`  stdout: ${trimmedOut}`);
+        recordLogLine(buildId, stage, trimmedOut);
+      }
+      if (stderr) {
+        const trimmedErr = redactSecrets(stderr.trim());
+        log(`  stderr: ${trimmedErr}`);
+        recordLogLine(buildId, stage, trimmedErr);
+      }
+    } catch (err) {
+      // Capture stdout/stderr from the failed command
+      const stdout = err.stdout || "";
+      const stderr = err.stderr || "";
+      if (stdout) {
+        const trimmedOut = redactSecrets(stdout.trim());
+        log(`  stdout: ${trimmedOut}`);
+        recordLogLine(buildId, stage, trimmedOut);
+      }
+      if (stderr) {
+        const trimmedErr = redactSecrets(stderr.trim());
+        log(`  stderr: ${trimmedErr}`);
+        recordLogLine(buildId, stage, trimmedErr);
+      }
+      throw err;
     }
   };
 
@@ -1076,6 +1168,22 @@ const buildSsgOutput = async ({ buildId, domain, workDir, publicOrigin }) => {
     await pinSiteDependencies(workDir);
     log(`Installing dependencies for ${domain}...`);
     await run(`npm install`);
+    const pkg = JSON.parse(await readFile(packageJsonPath, "utf8"));
+    await updateDepsHash(nodeModulesPath, pkg);
+  } else {
+    // Check if template CLI changed dependencies (e.g., added lottie-web)
+    try {
+      const pkg = JSON.parse(await readFile(packageJsonPath, "utf8"));
+      if (await shouldReinstallDeps(nodeModulesPath, pkg)) {
+        log(`  Dependencies changed — reinstalling`);
+        await rm(nodeModulesPath, { recursive: true, force: true });
+        await pinSiteDependencies(workDir);
+        await run(`npm install`);
+        await updateDepsHash(nodeModulesPath, pkg);
+      }
+    } catch (err) {
+      logErr(`Error checking dependencies for ${domain}: ${err.message}`);
+    }
   }
 
   // 4. Build static HTML with Vite + vike prerender
@@ -1396,20 +1504,37 @@ const buildDockerImage = async ({
     const redactedCmd = redactSecrets(cmd);
     log(`  $ ${redactedCmd}`);
     recordLogLine(buildId, stage, `$ ${redactedCmd}`);
-    const { stdout, stderr } = await execAsync(cmd, {
-      cwd: workDir,
-      maxBuffer: 10 * 1024 * 1024,
-      env: { ...process.env, ...extraEnv },
-    });
-    if (stdout) {
-      const trimmedOut = redactSecrets(stdout.trim());
-      log(`  stdout: ${trimmedOut}`);
-      recordLogLine(buildId, stage, trimmedOut);
-    }
-    if (stderr) {
-      const trimmedErr = redactSecrets(stderr.trim());
-      log(`  stderr: ${trimmedErr}`);
-      recordLogLine(buildId, stage, trimmedErr);
+    try {
+      const { stdout, stderr } = await execAsync(cmd, {
+        cwd: workDir,
+        maxBuffer: 10 * 1024 * 1024,
+        env: { ...process.env, ...extraEnv },
+      });
+      if (stdout) {
+        const trimmedOut = redactSecrets(stdout.trim());
+        log(`  stdout: ${trimmedOut}`);
+        recordLogLine(buildId, stage, trimmedOut);
+      }
+      if (stderr) {
+        const trimmedErr = redactSecrets(stderr.trim());
+        log(`  stderr: ${trimmedErr}`);
+        recordLogLine(buildId, stage, trimmedErr);
+      }
+    } catch (err) {
+      // Capture stdout/stderr from the failed command
+      const stdout = err.stdout || "";
+      const stderr = err.stderr || "";
+      if (stdout) {
+        const trimmedOut = redactSecrets(stdout.trim());
+        log(`  stdout: ${trimmedOut}`);
+        recordLogLine(buildId, stage, trimmedOut);
+      }
+      if (stderr) {
+        const trimmedErr = redactSecrets(stderr.trim());
+        log(`  stderr: ${trimmedErr}`);
+        recordLogLine(buildId, stage, trimmedErr);
+      }
+      throw err;
     }
   };
 
@@ -1552,20 +1677,37 @@ const publishBuildSsr = async ({ buildId }) => {
     const redactedCmd = redactSecrets(cmd);
     log(`  $ ${redactedCmd}`);
     recordLogLine(buildId, stage, `$ ${redactedCmd}`);
-    const { stdout, stderr } = await execAsync(cmd, {
-      cwd: workDir,
-      maxBuffer: 10 * 1024 * 1024,
-      env: { ...process.env, ...extraEnv },
-    });
-    if (stdout) {
-      const trimmedOut = redactSecrets(stdout.trim());
-      log(`  stdout: ${trimmedOut}`);
-      recordLogLine(buildId, stage, trimmedOut);
-    }
-    if (stderr) {
-      const trimmedErr = redactSecrets(stderr.trim());
-      log(`  stderr: ${trimmedErr}`);
-      recordLogLine(buildId, stage, trimmedErr);
+    try {
+      const { stdout, stderr } = await execAsync(cmd, {
+        cwd: workDir,
+        maxBuffer: 10 * 1024 * 1024,
+        env: { ...process.env, ...extraEnv },
+      });
+      if (stdout) {
+        const trimmedOut = redactSecrets(stdout.trim());
+        log(`  stdout: ${trimmedOut}`);
+        recordLogLine(buildId, stage, trimmedOut);
+      }
+      if (stderr) {
+        const trimmedErr = redactSecrets(stderr.trim());
+        log(`  stderr: ${trimmedErr}`);
+        recordLogLine(buildId, stage, trimmedErr);
+      }
+    } catch (err) {
+      // Capture stdout/stderr from the failed command
+      const stdout = err.stdout || "";
+      const stderr = err.stderr || "";
+      if (stdout) {
+        const trimmedOut = redactSecrets(stdout.trim());
+        log(`  stdout: ${trimmedOut}`);
+        recordLogLine(buildId, stage, trimmedOut);
+      }
+      if (stderr) {
+        const trimmedErr = redactSecrets(stderr.trim());
+        log(`  stderr: ${trimmedErr}`);
+        recordLogLine(buildId, stage, trimmedErr);
+      }
+      throw err;
     }
   };
 
