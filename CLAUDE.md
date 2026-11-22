@@ -1,334 +1,70 @@
 # CLAUDE.md — webstudio-publisher
 
-Service Node.js (ESM, no build step) qui publie les sites lors d'une publication, avec support multi-destinations.
+Node.js service (ESM, no build step, no npm dependencies): the whole service is
+`server.mjs`. API and environment variables: see README.
 
 ## Branches
 
-- Branche principale : `main`
-- Toutes les branches de fix/feature partent de `main` et ouvrent une PR vers `main`.
-
-## Fichier principal
-
-`server.mjs` — tout le service tient dans ce fichier unique. Pas de dépendances npm locales.
-
-## Cibles de publication — `renderMode` × `host`
-
-Une cible de publication = deux axes orthogonaux dans le body du `POST /publish` :
-
-| `renderMode` | `host` | pipeline | statut |
-|---|---|---|---|
-| `ssg` | `local` | `publishBuild` — Vite prerender → `/var/publish/<host>/` | ✅ |
-| `ssr` | `local` | `publishBuildSsr` — `docker build` + `docker run` par domaine | ✅ |
-| `ssg` | `cloudflare` | `publishBuildCloudflare` — `wrangler pages deploy` | ✅ (si `CLOUDFLARE_*`) |
-| `ssg` | `ssh` | `publishBuildSsh` — `rsync` de l'output SSG vers un serveur distant | ✅ (cible par domaine via `POST /targets/ssh-setup`) |
-| `ssr` | `coolify` | `publishBuildCoolifySsr` — image SSR → `REGISTRY_URL` → deploy webhook Coolify | ✅ (si `REGISTRY_URL` ; webhook par publish) |
-| `ssg` | `coolify` | `publishBuildCoolifySsg` — `buildSsgOutput` → image `nginx:alpine` → `REGISTRY_URL` → deploy webhook | ✅ (si `REGISTRY_URL` ; webhook par publish) |
-
-Le mapping request → pipeline vit dans `RENDER_HOSTS` / `normalizeTarget` / `availableTargets`
-(section « Publish target » de `server.mjs`). En interne, `state.json.mode` vaut
-`ssg` (local), `docker` (pour `ssr` local), `cloudflare`, `ssh` ou `coolify`.
-
-**Champ `buildMode` hérité** — toujours accepté (CLI `webstudio` npm upstream, anciennes
-images builder). Mapping : `ssg` → `ssg`/`local`, `ssr` → `ssr`/`local`,
-`cloudflare` → `ssg`/`cloudflare`.
-
-`GET /capabilities` renvoie `{ cloudflare, coolify, ssh, targets: ["ssg:local", …] }` —
-`targets` = les paires réellement disponibles, que le builder utilise pour griser les autres.
-
-### `ssr` — Container Docker par domaine
-
-```
-POST /publish { buildId, builderOrigin, buildMode: "ssr" }
-  → webstudio sync --buildId --origin --authToken
-  → webstudio build --template docker
-  → écriture de react-router.config.ts (allowedActionOrigins = publishDomain + customDomains)
-  → écriture de patch-navlink.cjs (lancé dans le docker build : stage build pour le bundle client ET image finale pour les node_modules du serveur SSR)
-  → écriture de DOCKER_SITE_DOCKERFILE dans workDir/Dockerfile
-  → DOCKER_BUILDKIT=1 docker build -t <ws-domain> .   ← une seule fois
-  → docker run -d --init --restart=unless-stopped --network=$DOCKER_NETWORK --name <ws-domain>-<ts base36>
-     (l'ancien container continue de servir le site)
-  → waitForContainerReady : GET <nouveau>:3000/ jusqu'à réponse < 500 (CONTAINER_READY_TIMEOUT_MS)
-     → échec : nouveau container supprimé, l'ancien reste en ligne, la publication échoue
-  → state.json { mode: "docker", imageName, containerName, publishDomain, customDomains }
-  → bascule de dockerHostContainer vers le nouveau container (custom domains retirés depuis = supprimés)
-  → attente CONTAINER_DRAIN_MS (5 s) puis docker stop/rm de l'ancien container
-  → docker image prune -f
-```
-
-Déploiement blue/green : aucune coupure du site pendant une publication.
-
-**Infra requise** : monter `/var/run/docker.sock` dans le container publisher.
-Un warning est loggé au démarrage si le socket n'est pas accessible.
-
-Un seul container par domaine hors bascule (nom = `ws-<slug>-<timestamp base36>`, change à chaque publication — la source de vérité est `state.json.containerName`), joignable par le proxy sur
-`<container>:3000` via `DOCKER_NETWORK` — pas de mapping de port publié.
-
-**Pourquoi un patch dans le build** : le site installe `@webstudio-is/sdk-components-react-router`
-depuis le registre npm **upstream** (version du CLI) — un correctif dans le fork ne l'atteint jamais.
-`patch-navlink.cjs` réécrit `lib/components.js` compilé (SDK < 0.314.0) et `@webstudio-is/sdk/lib/link-utils.js` (SDK ≥ 0.314.0, où la logique active-link a migré). Le patch ne s'applique que si le motif est trouvé (sinon warning visible et exit 0) et est idempotent.
-
-**`allowedActionOrigins`** : React Router 7 refuse un POST dont l'`Origin` ≠ `request.url` ; derrière le
-proxy TLS le container ne voit que du `http` → 400 sur tout formulaire. Liste exacte de hostnames, figée
-au build (un custom domain ajouté après nécessite une republication).
-
-**Optimisations** (`DOCKER_SITE_DOCKERFILE`) :
-- Build multi-stage : prod deps uniquement dans l'image finale
-- Cache mounts BuildKit sur `/root/.npm` → pas de re-download entre les republications
-
-### `ssg` — Nginx / proxy local (défaut)
-
-```
-POST /publish { buildId, builderOrigin, buildMode: "ssg" }
-  → webstudio sync --buildId --origin --authToken
-  → webstudio build --template ssg
-  → patch des +data.ts (fix prerender origin)
-  → npm install (si node_modules absent ou vike version changée)
-  → WEBSTUDIO_PRERENDER_ORIGIN=... WEBSTUDIO_SITEMAP_ORIGIN=... npx vite build
-  → réécriture des URLs absolues (.html et .xml) vers l'origine publique
-  → cp dist/client → dossier caché puis rename atomique vers /var/publish/<domain>/ (publishDirAtomically, sans coupure ; + une copie par custom domain,
-    réécrite vers l'origine de ce domaine)
-  → state.json { mode: "ssg", publishDomain, customDomains }
-```
-
-Les étapes `sync → build → vite build → réécriture URLs` sont extraites dans
-`buildSsgOutput()` (retourne `dist/client/`), partagé avec le mode `ssh`.
-
-### `ssh` — SSG sur un serveur distant
-
-Config **une fois par domaine** (la clé privée n'est pas renvoyée à chaque publish) :
-
-```
-POST /targets/ssh-setup
-  { domain, sshHost, sshUser, sshPath, sshPort?, sshPrivateKey, publicUrl? }
-  → /var/work/<domain>/ssh_key      (chmod 600, jamais loggée)
-  → /var/work/<domain>/target.json  { sshHost, sshUser, sshPath, sshPort, publicUrl }
-  → /var/work/<domain>/known_hosts  (ssh-keyscan, best-effort)
-```
-
-Publish :
-
-```
-POST /publish { buildId, renderMode: "ssg", host: "ssh" }
-  → lecture target.json (échec net + commande curl si absente)
-  → arrêt de ce qui servait le site localement (container / route CF / Traefik) + purge /var/publish/<hostnames>
-  → buildSsgOutput()  (origine = publicUrl ?? 1er custom domain ?? hostname wstd)
-  → rsync -az --delete -e "ssh -i ssh_key -o UserKnownHostsFile=known_hosts -o StrictHostKeyChecking=accept-new" dist/client/ user@host:path/
-  → state.json { mode: "ssh", publishDomain, customDomains, sshHost, sshPath, publicUrl }
-```
-
-Le publisher **ne sert pas** le site et n'écrit **aucune** config Traefik — TLS +
-routing sur le serveur distant sont à la charge de l'utilisateur. `unpublish`
-oublie le site localement ; les fichiers distants sont laissés en place.
-
-Image : `rsync` + `openssh-client` (+ `curl` + `jq` pour appeler l'API depuis
-`docker compose exec`) ajoutés au `Dockerfile`.
-
-### `coolify` — SSR ou SSG sur un Coolify distant
-
-Le publisher ne possède aucun identifiant Coolify. Chaque site est hébergé sur
-**le Coolify de son propriétaire**, potentiellement un serveur différent.
-
-Config **instance-wide** (`.env` publisher) : `REGISTRY_URL` (+ `REGISTRY_USER` /
-`REGISTRY_TOKEN` si privé) — le registre où le publisher **pousse** l'image, et
-d'où le Coolify du client **pull**.
-
-Config **par site** : le `deployWebhookUrl` (+ token optionnel) de l'app Coolify,
-envoyé dans le body du `POST /publish` (`coolifyWebhookUrl` / `coolifyWebhookToken`).
-
-```
-POST /publish { buildId, renderMode: "ssr"|"ssg", host: "coolify", coolifyWebhookUrl, coolifyWebhookToken? }
-  → stopLocalServing() : arrêt container/route + purge /var/publish + Traefik
-  → ssr : buildDockerImage()  |  ssg : buildSsgOutput() + Dockerfile nginx:alpine (+ .dockerignore)
-      tag = $REGISTRY_URL/ws-<slug>:latest
-  → deployImageToCoolify() : docker tag :<buildId> ; docker login (token via env) ;
-      docker push :latest + :<buildId> ; POST coolifyWebhookUrl (Bearer)
-  → state.json { mode: "coolify", renderMode, imageRepo, webhookUrl, publishDomain, customDomains }
-```
-
-Le publisher **ne parle jamais à l'API Coolify** autrement que via ce webhook, ne
-sert pas le site, n'écrit pas de Traefik, et **ne poll pas** (un 2xx du webhook =
-« déploiement en file »). `unpublish` oublie le site localement ; l'app Coolify et
-les images du registre sont laissées en place (elles appartiennent au client).
-`isSafeWebhookUrl` rejette le non-https et les hôtes loopback/privés (anti-SSRF).
-
-- **SSR** : `DOCKER_SITE_DOCKERFILE` (`ENV IPX_HTTP_ALLOW_ALL_DOMAINS=true` + `EXPOSE 3000`)
-  → l'app Coolify du client pointe sur l'image, port 3000.
-- **SSG** : `COOLIFY_SSG_DOCKERFILE` (`FROM nginx:alpine` + `COPY dist/client` + `nginx.conf`
-  fallback `.html` / cache immutable sur `/_assets`,`/assets`) → port 80. Origine des
-  `og:`/`sitemap` = 1er custom domain publié, sinon hostname wstd.
-
-### `cloudflare` — Cloudflare Pages
-
-```
-POST /publish { buildId, builderOrigin, buildMode: "cloudflare" }
-  → arrêt du mode précédent (container docker) + purge de /var/publish/<hostname>
-  → webstudio sync --buildId --origin --authToken
-  → webstudio build --template cloudflare
-  → npm install (si node_modules absent OU appartient à un autre template)
-  → npm run build  (remix vite:build → build/client/)
-  → ./node_modules/.bin/wrangler pages project create <domain-sanitisé> --production-branch main   ← si absent
-  → ./node_modules/.bin/wrangler pages deploy ./build/client --project-name <domain-sanitisé> --branch main
-  → rattachement de chaque customDomain au projet Pages (API Cloudflare)
-  → state.json { mode: "cloudflare", cfProjectName, publishDomain, customDomains }
-```
-
-Requiert `CLOUDFLARE_API_TOKEN` et `CLOUDFLARE_ACCOUNT_ID`.
-
-**Le projet CF Pages n'est PAS créé automatiquement par le deploy.** wrangler 3 le
-faisait ; wrangler 4 a supprimé ce comportement et échoue avec `The Pages project
-"<name>" does not exist`. D'où le `pages project create` explicite, qui est correct sur
-les deux majeures.
-
-**wrangler tourne depuis le `node_modules` local, jamais en global.** Le template
-épingle `wrangler@^3.63.2` en devDependency ; `npm install` (étape précédente) installe
-donc déjà la bonne version dans `node_modules/.bin/wrangler` de chaque workDir. Un
-`npm install -g wrangler` résout toujours la dernière version, qui dérive de l'épingle
-du template dès qu'une nouvelle majeure sort — c'est exactement ce qui a cassé
-`pages project create` avec wrangler 4.
-
-`--branch` est explicite parce que `workDir` n'est pas un dépôt git : sans lui wrangler
-ne peut pas déduire qu'il s'agit de la branche de production et le déploiement part en
-preview au lieu de `<project>.pages.dev`.
-
-**Les custom domains sont attachés via l'API Cloudflare, pas wrangler.** Le CLI n'a
-aucune commande pour ça (`wrangler pages project` se limite à create/delete/list) — donc
-`POST /accounts/:account_id/pages/projects/:project_name/domains` avec
-`{ "name": "<domain>" }`, idempotent (une tentative sur un domaine déjà attaché échoue
-proprement côté API, loggé et ignoré). Ça n'enregistre le domaine que côté Pages ;
-l'enregistrement DNS (CNAME vers `<project>.pages.dev`) reste à la charge de
-l'utilisateur.
-
-Le projet Pages n'est jamais supprimé par le publisher — ni sur changement de mode, ni
-sur unpublish. C'est un appel destructeur dans le compte Cloudflare de l'utilisateur ;
-le site reste joignable sur `<project>.pages.dev` et doit être retiré à la main.
-
-**Le domaine de staging local (`<slug>.wstdwork.morain.fr`) reste fonctionnel.** Pages
-ne sert que sur `<project>.pages.dev` (+ les custom domains attachés) — sans rien de
-plus, le domaine de staging que le builder affiche toujours comme "site publié" 404
-puisque `/var/publish/<hostname>` est purgé à l'entrée en mode cloudflare. Le proxy
-(port `PROXY_PORT`) reverse-proxy donc ce domaine vers `<cfProjectName>.pages.dev` via
-la map `cfProjectHost` (hostname de staging → nom de projet), remplie à la publication
-et restaurée au démarrage depuis `state.json`. Un custom domain n'y entre jamais : son
-DNS pointe directement sur Cloudflare et ne repasse pas par le publisher.
-
-Les jobs sont sérialisés **par domaine** via une queue de promesses (`projectQueues`), puis limités globalement par `MAX_CONCURRENT_PUBLISHES` (sémaphore `acquirePublishSlot`/`releasePublishSlot`).
-
-## Proxy de sites (port PROXY_PORT)
-
-Le serveur proxy sur port 4001 sert tous les sites publiés :
-- **SSR** (`mode: "docker"`) : reverse-proxy vers le container Docker du domaine (`<container>:3000` sur `DOCKER_NETWORK`)
-- **Cloudflare** (`mode: "cloudflare"`) : le hostname de staging est reverse-proxié vers `<project>.pages.dev`
-- **SSG** : fichiers statiques servis directement depuis `/var/publish/<host>/`
-
-## Logs de publication
-
-Chaque publication est loggée avec capture de tous les stdout/stderr des étapes (`sync`, `build`, `deploy`, etc.). Les logs sont :
-- Écrits pendant la publication dans `/var/work/<domain>/logs/<buildId>.log` (plain text, une ligne par étape)
-- Accompagnés d'une métadonnée JSON `/var/work/<domain>/logs/<buildId>.json` : `{ startedAt, completedAt, outcome, failedStage }`
-- Accessibles via l'endpoint `GET /logs/<buildId>?includeLog=true&cursor=...` (authentification Bearer requise)
-
-**Endpoint `GET /logs/<buildId>`** :
-```
-Authentification: Authorization: Bearer <TRPC_SERVER_API_TOKEN>
-
-Query params:
-  - includeLog (optional) : inclure le contenu du log (base64url, chunké)
-  - cursor (optional) : position du dernier chunk reçu (pagination)
-
-Response:
-  { 
-    availability: "pending" | "available" | "unavailable",
-    outcome?: "succeeded" | "failed",
-    logAvailability?: "available" | "unavailable",
-    startedAt?: ISO8601,
-    completedAt?: ISO8601,
-    failedStage?: enum,
-    log?: { encoding: "base64url", chunk, complete, nextCursor? }
-  }
-```
-
-Tous les secrets (tokens, clés, etc.) sont masqués dans les logs via `redactSecrets()`. Les logs sont conservés selon `PUBLISH_LOG_RETENTION` (par défaut 5 par domaine).
-
-Le POST /publish retourne maintenant `{ success: true, logHandle: <buildId> }` pour permettre au builder de récupérer les logs via getPublishLog.
-
-## Persistance de l'état (`state.json`)
-
-Chaque domaine publié écrit `/var/work/<domain>/state.json` :
-```json
-{ "mode": "docker", "imageName": "ws-mysite", "containerName": "ws-mysite-mi8x2k1a", "publishDomain": "mysite.wstd.work", "customDomains": [] }
-```
-`mode` ∈ `ssg` | `docker` | `cloudflare` | `ssh` | `coolify`. C'est ce qui permet à
-la publication suivante de détecter le mode précédent et de nettoyer ce qu'il faut
-(un pipeline distant purge les fichiers statiques + container + Traefik d'un ancien
-mode local, etc.).
-
-Au démarrage, `restoreTargets()` relit tous les `state.json` : les containers Docker sont (re)démarrés, les routes de staging Cloudflare ré-enregistrées. SSG / SSH / Coolify n'ont rien à restaurer (fichiers sur disque, ou site hébergé ailleurs).
-
-## Variables d'environnement
-
-| Variable | Rôle |
-|----------|------|
-| `TRPC_SERVER_API_TOKEN` | Token d'auth pour l'API du builder |
-| `BUILDER_INTERNAL_URL` | URL interne Docker du builder (défaut: `http://app:3000`) |
-| `PUBLISHER_HOST` | Suffixe de domaine pour les slugs sans point |
-| `TRAEFIK_DYNAMIC_DIR` | Si défini, écrit les configs Traefik pour les domaines custom |
-| `PORT` | Port de l'API build (défaut: 4000) |
-| `PROXY_PORT` | Port du proxy de sites (défaut: 4001) |
-| `CONTAINER_READY_TIMEOUT_MS` | Attente max pour qu'un nouveau container SSR réponde avant d'abandonner et garder l'ancien en ligne (défaut: 60000) |
-| `MAX_CONCURRENT_PUBLISHES` | Nb max de publications simultanées, tous domaines confondus (défaut: 0 = illimité ; file FIFO au-delà) |
-| `CLOUDFLARE_API_TOKEN` | Token Wrangler pour deploy CF Pages (mode `cloudflare`) |
-| `CLOUDFLARE_ACCOUNT_ID` | ID compte Cloudflare (mode `cloudflare`) |
-| `CLOUDFLARE_PRODUCTION_BRANCH` | Branche de production des projets Pages créés (défaut: `main`) |
-| `REGISTRY_URL` | Registre où pousser les images SSR pour `host: coolify` (ex: `ghcr.io/my-org`) — active la cible `ssr:coolify` |
-| `REGISTRY_USER` / `REGISTRY_TOKEN` | Identifiants d'écriture du registre (si privé) |
-| `PUBLISH_LOG_RETENTION` | Nombre de logs de publication à conserver par domaine (défaut: `5`) |
-
-## Points d'attention
-
-- `BUILDER_INTERNAL_URL` évite de passer par Traefik/TLS depuis le container
-- Le patch `patchDataFilesForPrerender` corrige un bug vike où `pageContext.headers` est vide au build time
-- vike est épinglé à `TARGET_VIKE` (constante dans le code) — ne pas changer sans tester
-- rollup est forcé à `PINNED_ROLLUP` via `overrides` dans le `package.json` généré (`pinSiteDependencies`, avant tout `npm install`/`docker build`) : rollup 4.68.6 casse le parse natif musl (« Code is nested too deeply ») et tous les builds tournent sur Alpine. À retirer dès qu'une version corrigée sort
-- Les custom domains (contenant un `.`) reçoivent une config Traefik auto-générée pour Let's Encrypt
-- Le nom de projet CF Pages est dérivé du domain (sanitisé en `[a-z0-9-]+`, max 58 chars)
-- Transition SSG→SSR : les `node_modules` sont forcément réinstallés (templates incompatibles)
-- Transition SSR→SSG : le container Docker est stoppé/supprimé proprement avant le build SSG
-
-## Docker
-
-```bash
-docker build -t webstudio-publisher .
-# Image publiée sur : ghcr.io/webstudio-community/webstudio-publisher
-```
-
-### CLI webstudio — servi par le builder (IMPORTANT)
-
-Le handshake `webstudio sync` est verrouillé par un hash de contrat de bundle + la
-surface des routes tRPC, dérivés du schéma du **fork**. Le CLI npm upstream
-(`webstudio@latest`) est rejeté par l'API du fork (`apiCompatibilityError`).
-
-→ Chaque builder sert son propre CLI (build depuis son commit) sur `/npm/`
-(webstudio-fork#88, paquet `@webstudio-community/cli`). Le publisher **n'embarque
-plus de CLI** : `server.mjs` lance `WEBSTUDIO_CLI`, soit
-`npx --yes --@webstudio-community:registry=${BUILDER_INTERNAL_URL}/npm/ @webstudio-community/cli <sync|build …>`.
-`npx` compare `dist-tags.latest` à chaque run → un builder redéployé est pris en
-compte au publish suivant, sans rebuild de l'image publisher.
-
-- Cache `npx` : `NPM_CONFIG_CACHE=/var/work/.npm-cache` (volume `publisher-work`,
-  surchargeable par la variable d'environnement). Le 1er publish après une mise à jour
-  du builder est plus lent (téléchargement du paquet).
-- Le publisher dépend de la disponibilité du builder pour publier (déjà vrai pour
-  `sync`) ; si `/npm/` répond 404 (builder sans CLI packé), le publish échoue.
-- Ne jamais revenir à `npm install -g webstudio@latest`.
-- La version des packages `@webstudio-is/*` des sites générés est stampée côté builder
-  (`WEBSTUDIO_SDK_VERSION`, Dockerfile du builder, stage `cli`).
-- Plus de CI croisée : `docker-publish.yml` ne lit plus le label du builder et n'accepte
-  plus `builder_ref` / `image_tag` / `nonce`. Tester une branche builder = déployer son
-  image `builder:<branche>` : son CLI est servi par `/npm/`, aucune image publisher dédiée.
+Branch from `main`, open the PR against `main`.
+
+## Publish targets: `renderMode` × `host`
+
+| target | pipeline |
+|---|---|
+| `ssg:local` | `publishBuild`: vike prerender → `/var/publish/<host>/`, atomic swap |
+| `ssr:local` | `publishBuildSsr`: one container per domain, blue/green switch |
+| `ssg:cloudflare` | `publishBuildCloudflare`: `wrangler pages deploy` |
+| `ssg:ssh` | `publishBuildSsh`: rsync to a remote server |
+| `ssr:coolify` / `ssg:coolify` | image → `REGISTRY_URL` → Coolify deploy webhook |
+
+- Request → pipeline mapping: `RENDER_HOSTS`, `normalizeTarget`, `availableTargets`.
+- `/var/work/<domain>/state.json` stores the previous mode (`ssg`, `docker`,
+  `cloudflare`, `ssh`, `coolify`) so the next publish can tear it down, and
+  `restoreTargets()` restarts containers and Cloudflare staging routes on boot.
+- Jobs run one at a time per domain (`projectQueues`), capped globally by
+  `MAX_CONCURRENT_PUBLISHES`.
+- The proxy (`PROXY_PORT`) serves every site: SSR → `<container>:3000`,
+  Cloudflare staging → `<project>.pages.dev`, SSG → `/var/publish/<host>/`.
+
+## Pitfalls
+
+- **CLI**: run via `WEBSTUDIO_CLI` (npx from the builder's `/npm/` registry,
+  `@webstudio-community/cli`). The upstream `webstudio` npm CLI is rejected by
+  the fork's API. Never go back to `npm install -g webstudio`.
+- **Generated sites install `@webstudio-is/*` from npm upstream**: a fork fix on
+  those packages never reaches them. Patch inside the build (`patch-navlink.cjs`)
+  or through the CLI template.
+- `TARGET_VIKE` pins vike; don't change without testing a publish.
+- `PINNED_ROLLUP` works around rollup 4.68.6 on musl; drop once fixed.
+- `patchDataFilesForPrerender`: `pageContext.headers` is empty at prerender.
+- Cloudflare: wrangler comes from the template's `node_modules`, the project is
+  created explicitly (wrangler 4), and it is never deleted by the publisher.
+- Coolify: no Coolify credentials, no polling; `isSafeWebhookUrl` blocks SSRF.
+- Every logged command goes through `redactSecrets()`.
 
 ## CI
 
-`.github/workflows/ci.yml` (PR, push `main`) : `server` (`node --check server.mjs` puis démarrage réel + `GET /health` sur le port 4000), `dockerfile` (hadolint, erreurs uniquement) et `workflows` (yamllint + actionlint sur `.github`). Le build d'image reste couvert par `docker-publish.yml`, qui tourne aussi sur les PR.
+`ci.yml`: `node --check`, a real start + `GET /health`, hadolint, yamllint +
+actionlint. A new required environment variable needs a value in the
+"/health" step. The image build runs in `docker-publish.yml`, PRs included.
 
-- Le smoke test ne lance aucune publication : il valide que le fichier unique `server.mjs` se charge et écoute (une erreur de syntaxe ou d'import au top-level casserait le publisher en prod sans autre signal avant le déploiement).
-- Une nouvelle variable d'environnement **obligatoire** au démarrage doit recevoir une valeur dans l'étape « Démarrage + /health » du workflow.
+## Comments & commits
+
+Match upstream Webstudio: comments are rare (<1 % of lines).
+
+- No comment by default; a clear name beats a comment. Comment only a
+  non-obvious *why*: external constraint, workaround, trap, required order.
+  - ✅ `// Navigation can discard Chrome's body before the next DOM poll.`
+  - ❌ `// Check if any custom domains are selected` (restates the code)
+- One line, plain English, present tense; three lines at most.
+- JSDoc only for a non-trivial exported API or `@deprecated`; no `@param` /
+  `@returns` that repeat the signature.
+- Never: our own issue/PR numbers, history ("now", "used to", "fix:"), section
+  banners, emojis, French, step numbering that mirrors the code. An upstream
+  issue link that tells when to drop a workaround is fine.
+- Config files (YAML, `.env`, Dockerfile, nginx): one line for each non-obvious
+  setting.
+- Commits: `type(scope): summary`, imperative, lowercase, ≤ 72 chars, English,
+  one `(#n)` at most. Body: why, in short prose.
+- PRs: problem, cause, fix in 1–2 paragraphs; a `- [x]` checklist of the checks
+  actually run; `Closes #n` / `Ref #n` last.
